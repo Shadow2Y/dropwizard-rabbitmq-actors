@@ -95,35 +95,40 @@ public class Handler<Message> extends DefaultConsumer {
                                final byte[] body) throws IOException {
         running = true;
         try {
-            val expired = isExpired(properties);
-            val message = mapper.readValue(body, clazz);
-            Callable<Boolean> handleCallable = () -> handle(message, populateMessageMeta(envelope, properties), expired);
-
-            if (retryStrategy.execute(handleCallable, queueName, body, properties)) {
+            if (processDelivery(envelope, properties, body)) {
                 getChannel().basicAck(envelope.getDeliveryTag(), false);
             } else {
                 getChannel().basicReject(envelope.getDeliveryTag(), false);
             }
-        } catch (RetrySchedulingException t) {
-            log.error("Retry handoff failed; re-queuing delivery", t);
+        } catch (RetrySchedulingException failure) {
+            log.error("Retry handoff failed; re-queuing delivery", failure);
             getChannel().basicNack(envelope.getDeliveryTag(), false, true);
-        } catch (Throwable t) {
-            log.error("Error processing message...", t);
-            if (Boolean.TRUE.equals(errorCheckFunction.apply(t))) {
-                log.warn("Acked message due to exception: ", t);
-                getChannel().basicAck(envelope.getDeliveryTag(), false);
-            } else if (exceptionHandler.handle()) {
-                log.warn("Acked message due to exception handling strategy: ", t);
-                getChannel().basicAck(envelope.getDeliveryTag(), false);
-            } else {
-                getChannel().basicReject(envelope.getDeliveryTag(), false);
-            }
         } finally {
             synchronized (this) {
                 running = false;
                 notifyAll();
             }
         }
+    }
+
+    private boolean processDelivery(final Envelope envelope,
+                                    final AMQP.BasicProperties properties,
+                                    final byte[] body) throws RetrySchedulingException {
+        try {
+            val expired = isExpired(properties);
+            val message = mapper.readValue(body, clazz);
+            Callable<Boolean> handleCallable = () -> handle(message, populateMessageMeta(envelope, properties), expired);
+            return retryStrategy.execute(handleCallable, queueName, body, properties);
+        } catch (RetrySchedulingException failure) {
+            throw failure;
+        } catch (Throwable failure) {
+            return handleProcessingFailure(failure);
+        }
+    }
+
+    private boolean handleProcessingFailure(final Throwable failure) {
+        log.error("Error processing message...", failure);
+        return Boolean.TRUE.equals(errorCheckFunction.apply(failure)) || exceptionHandler.handle();
     }
 
     public synchronized void awaitCompletion() throws InterruptedException {
