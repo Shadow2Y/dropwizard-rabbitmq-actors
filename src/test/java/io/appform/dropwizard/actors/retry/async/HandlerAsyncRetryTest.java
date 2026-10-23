@@ -6,29 +6,45 @@ import com.github.rholder.retry.RetryException;
 import com.rabbitmq.client.AMQP;
 import com.rabbitmq.client.Channel;
 import com.rabbitmq.client.Envelope;
+import io.appform.dropwizard.actors.actor.ActorConfig;
 import io.appform.dropwizard.actors.base.Handler;
+import io.appform.dropwizard.actors.common.Constants;
+import io.appform.dropwizard.actors.connectivity.RMQConnection;
 import io.appform.dropwizard.actors.exceptionhandler.config.DropConfig;
 import io.appform.dropwizard.actors.exceptionhandler.config.SidelineConfig;
+import io.appform.dropwizard.actors.exceptionhandler.handlers.ExceptionHandler;
 import io.appform.dropwizard.actors.exceptionhandler.handlers.MessageDropHandler;
 import io.appform.dropwizard.actors.exceptionhandler.handlers.MessageSidelineHandler;
 import io.appform.dropwizard.actors.observers.TerminalRMQObserver;
+import io.appform.dropwizard.actors.retry.RetryMode;
 import io.appform.dropwizard.actors.retry.RetryStrategy;
+import io.appform.dropwizard.actors.retry.RetryStrategyFactory;
+import io.appform.dropwizard.actors.retry.config.CountLimitedFixedWaitRetryConfig;
+import io.appform.dropwizard.actors.retry.config.CountLimitedIncrementalWaitRetryConfig;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
+import org.mockito.ArgumentCaptor;
 
 import java.io.IOException;
+import java.util.Map;
+import java.util.Set;
 import java.util.concurrent.Callable;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicReference;
+import java.util.function.Function;
 
+import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertInstanceOf;
+import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.anyBoolean;
 import static org.mockito.ArgumentMatchers.anyLong;
 import static org.mockito.ArgumentMatchers.anyString;
 import static org.mockito.ArgumentMatchers.eq;
+import static org.mockito.Mockito.doThrow;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.spy;
@@ -60,8 +76,8 @@ class HandlerAsyncRetryTest {
         handler = handler(error -> false, new MessageSidelineHandler(new SidelineConfig()));
     }
 
-    private Handler<TestMessage> handler(java.util.function.Function<Throwable, Boolean> errorCheck,
-                                         io.appform.dropwizard.actors.exceptionhandler.handlers.ExceptionHandler exceptionHandler) throws Exception {
+    private Handler<TestMessage> handler(Function<Throwable, Boolean> errorCheck,
+                                         ExceptionHandler exceptionHandler) throws Exception {
         return new Handler<>(channel, mapper, TestMessage.class, 1,
                 errorCheck, retryStrategy, exceptionHandler,
                 (message, metadata) -> true, (message, metadata) -> true,
@@ -139,5 +155,158 @@ class HandlerAsyncRetryTest {
         verify(channel, never()).basicCancel(anyString());
         assertFalse(dropPolicyHandler.isRunning());
         dropPolicyHandler.awaitCompletion();
+    }
+
+    @Test
+    void deliveryExpiringDuringTransportCooldownUsesExpiredHandler() throws Exception {
+        var scheduler = mock(AsyncRetryScheduler.class);
+        when(scheduler.restoreState(anyString(), any(), anyLong()))
+                .thenAnswer(invocation -> new RetryState(1, invocation.getArgument(2)));
+        doThrow(new IOException("broker unavailable")).when(scheduler)
+                .schedule(anyString(), any(), any(), any(), anyLong());
+        var config = new CountLimitedFixedWaitRetryConfig();
+        config.setRetryMode(RetryMode.ASYNC);
+        config.setMaxAttempts(3);
+        var strategy = new RetryStrategyFactory().create(config, scheduler);
+        var handled = new AtomicBoolean();
+        var expired = new AtomicBoolean();
+        var target = new Handler<>(channel, mapper, TestMessage.class, 1, error -> false, strategy,
+                new MessageSidelineHandler(new SidelineConfig()), (message, metadata) -> {
+                    handled.set(true);
+                    return true;
+                }, (message, metadata) -> {
+                    expired.set(true);
+                    return true;
+                }, new TerminalRMQObserver(), QUEUE);
+        strategy.start();
+        try {
+            assertThrows(RetrySchedulingException.class,
+                    () -> strategy.execute(() -> {
+                        throw new IOException("business failure");
+                    }, QUEUE, body, new AMQP.BasicProperties()));
+            var properties = new AMQP.BasicProperties.Builder().headers(Map.of(
+                    Constants.MESSAGE_EXPIRY_TEXT, System.currentTimeMillis() + 300)).build();
+
+            target.handleDelivery("consumer-tag", new Envelope(DELIVERY_TAG, false, "exchange", QUEUE),
+                    properties, body);
+
+            assertFalse(handled.get());
+            assertTrue(expired.get());
+            verify(channel).basicAck(DELIVERY_TAG, false);
+            verify(channel, never()).basicReject(anyLong(), anyBoolean());
+        } finally {
+            strategy.stop();
+        }
+    }
+
+    @Test
+    void realRetryChainRejectsOnceWhenNewDelayExceedsLimit() throws Exception {
+        var connection = mock(RMQConnection.class);
+        var topology = mock(Channel.class);
+        var publisher = mock(Channel.class);
+        when(publisher.isOpen()).thenReturn(true);
+        when(connection.getRootObserver()).thenReturn(new TerminalRMQObserver());
+        when(connection.newChannel()).thenReturn(topology, publisher);
+        var scheduler = new TtlRequeueRetryScheduler(new TtlRequeueRetryScheduler.Context(connection,
+                new ActorConfig(), "exchange", QUEUE, Set.of(QUEUE)), 5000, 1);
+        var config = new CountLimitedIncrementalWaitRetryConfig();
+        config.setRetryMode(RetryMode.ASYNC);
+        config.setMaxAttempts(4);
+        var strategy = new RetryStrategyFactory().create(config, scheduler);
+        var attempts = new AtomicInteger();
+        var realHandler = new Handler<>(channel, mapper, TestMessage.class, 1, error -> false, strategy,
+                new MessageSidelineHandler(new SidelineConfig()), (message, metadata) -> {
+                    attempts.incrementAndGet();
+                    throw new IOException("business failure");
+                }, (message, metadata) -> true, new TerminalRMQObserver(), QUEUE);
+        scheduler.start();
+        try {
+            deliver(realHandler, DELIVERY_TAG);
+            var published = ArgumentCaptor.forClass(AMQP.BasicProperties.class);
+            verify(publisher).basicPublish(anyString(), eq(QUEUE), eq(true), published.capture(), any(byte[].class));
+            realHandler.handleDelivery("consumer-tag", new Envelope(8, false, "exchange", QUEUE),
+                    published.getValue(), body);
+
+            assertEquals(2, attempts.get());
+            verify(channel).basicAck(DELIVERY_TAG, false);
+            verify(channel).basicReject(8, false);
+            verify(channel, never()).basicNack(anyLong(), anyBoolean(), anyBoolean());
+            verify(publisher).basicPublish(anyString(), eq(QUEUE), eq(true), any(), any(byte[].class));
+        } finally {
+            strategy.stop();
+        }
+    }
+
+    @Test
+    void permanentSchedulingRejectionUsesSidelinePolicyWithoutRequeue() throws Exception {
+        when(retryStrategy.execute(any(), eq(QUEUE), any(byte[].class), any()))
+                .thenThrow(new RetrySchedulingRejectedException("Delay level limit reached"));
+
+        deliver(handler, DELIVERY_TAG);
+
+        verify(channel).basicReject(DELIVERY_TAG, false);
+        verify(channel, never()).basicAck(anyLong(), anyBoolean());
+        verify(channel, never()).basicNack(anyLong(), anyBoolean(), anyBoolean());
+        assertFalse(handler.isRunning());
+    }
+
+    @Test
+    void permanentSchedulingRejectionUsesDropPolicyWithoutRequeue() throws Exception {
+        var dropHandler = handler(error -> false, new MessageDropHandler(new DropConfig()));
+        when(retryStrategy.execute(any(), eq(QUEUE), any(byte[].class), any()))
+                .thenThrow(new RetrySchedulingRejectedException("Delay level limit reached"));
+
+        deliver(dropHandler, DELIVERY_TAG);
+
+        verify(channel).basicAck(DELIVERY_TAG, false);
+        verify(channel, never()).basicReject(anyLong(), anyBoolean());
+        verify(channel, never()).basicNack(anyLong(), anyBoolean(), anyBoolean());
+        assertFalse(dropHandler.isRunning());
+    }
+
+    @Test
+    void basicAckFailurePropagatesWithoutErrorCheckOrExceptionHandler() throws Exception {
+        var errorCheckInvoked = new AtomicBoolean(false);
+        var dropHandler = spy(new MessageDropHandler(new DropConfig()));
+        var ackFailureHandler = handler(error -> {
+            errorCheckInvoked.set(true);
+            return true;
+        }, dropHandler);
+        when(retryStrategy.execute(any(), eq(QUEUE), any(byte[].class), any()))
+                .thenAnswer(invocation -> ((Callable<?>) invocation.getArgument(0)).call());
+        doThrow(new IOException("channel closed before ack")).when(channel).basicAck(DELIVERY_TAG, false);
+
+        assertThrows(IOException.class, () -> deliver(ackFailureHandler, DELIVERY_TAG));
+
+        assertFalse(errorCheckInvoked.get());
+        verify(dropHandler, never()).handle();
+        verify(channel).basicAck(DELIVERY_TAG, false);
+        verify(channel, never()).basicReject(anyLong(), anyBoolean());
+        verify(channel, never()).basicNack(anyLong(), anyBoolean(), anyBoolean());
+        assertFalse(ackFailureHandler.isRunning());
+        ackFailureHandler.awaitCompletion();
+    }
+
+    @Test
+    void basicRejectFailurePropagatesWithoutErrorCheckOrExceptionHandler() throws Exception {
+        var errorCheckInvoked = new AtomicBoolean(false);
+        var dropHandler = spy(new MessageDropHandler(new DropConfig()));
+        var rejectFailureHandler = handler(error -> {
+            errorCheckInvoked.set(true);
+            return true;
+        }, dropHandler);
+        when(retryStrategy.execute(any(), eq(QUEUE), any(byte[].class), any())).thenReturn(false);
+        doThrow(new IOException("channel closed before reject")).when(channel).basicReject(DELIVERY_TAG, false);
+
+        assertThrows(IOException.class,
+                () -> deliver(rejectFailureHandler, DELIVERY_TAG));
+
+        assertFalse(errorCheckInvoked.get());
+        verify(dropHandler, never()).handle();
+        verify(channel).basicReject(DELIVERY_TAG, false);
+        verify(channel, never()).basicAck(anyLong(), anyBoolean());
+        verify(channel, never()).basicNack(anyLong(), anyBoolean(), anyBoolean());
+        assertFalse(rejectFailureHandler.isRunning());
+        rejectFailureHandler.awaitCompletion();
     }
 }

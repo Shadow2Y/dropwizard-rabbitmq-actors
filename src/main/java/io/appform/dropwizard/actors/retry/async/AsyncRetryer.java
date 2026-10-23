@@ -6,6 +6,8 @@ import io.appform.dropwizard.actors.retry.ActorRetryerBuilder;
 import lombok.extern.slf4j.Slf4j;
 
 import java.util.Objects;
+import java.util.Set;
+import java.util.TreeSet;
 import java.util.concurrent.Callable;
 import java.util.function.LongSupplier;
 
@@ -16,6 +18,9 @@ import java.util.function.LongSupplier;
  */
 @Slf4j
 public class AsyncRetryer implements ActorRetryer {
+
+    private static final int MAX_PLANNED_ATTEMPTS = 5;
+    private static final Throwable PLANNED_FAILURE = new IllegalStateException("Planned retry");
 
     private final ActorRetryerBuilder.Policy<Boolean> retryPolicy;
     private final AsyncRetryScheduler asyncRetryScheduler;
@@ -35,6 +40,31 @@ public class AsyncRetryer implements ActorRetryer {
     @Override
     public void start() throws Exception {
         asyncRetryScheduler.start();
+        try {
+            asyncRetryScheduler.prepare(plannedDelays());
+        } catch (Exception error) {
+            try {
+                asyncRetryScheduler.stop();
+            } catch (Exception stopError) {
+                error.addSuppressed(stopError);
+            }
+            throw error;
+        }
+    }
+
+    Set<Long> plannedDelays() throws RetrySchedulingRejectedException {
+        var delays = new TreeSet<Long>();
+        var elapsed = 0L;
+        for (long attemptNumber = 1; attemptNumber <= MAX_PLANNED_ATTEMPTS; attemptNumber++) {
+            var attempt = new DeliveryAttempt(null, PLANNED_FAILURE, attemptNumber, elapsed);
+            if (retryPolicy.stopStrategy().shouldStop(attempt)) {
+                return delays;
+            }
+            var delay = retryPolicy.waitStrategy().computeSleepTime(attempt);
+            delays.add(delay);
+            elapsed += delay;
+        }
+        throw new RetrySchedulingRejectedException("Planned delays exceed max attempts");
     }
 
     @Override
@@ -43,7 +73,8 @@ public class AsyncRetryer implements ActorRetryer {
     }
 
     @Override
-    public boolean call(Callable<Boolean> callable, String queueName, byte[] body, AMQP.BasicProperties properties) throws Exception {
+    public boolean call(Callable<Boolean> callable, String queueName, byte[] body,
+                        AMQP.BasicProperties properties) throws Exception {
         Objects.requireNonNull(callable, "callable");
         Objects.requireNonNull(queueName, "queueName");
         var now = clock.getAsLong();
@@ -72,10 +103,9 @@ public class AsyncRetryer implements ActorRetryer {
         } catch (InterruptedException error) {
             Thread.currentThread().interrupt();
             throw new RetrySchedulingException("Interrupted while scheduling retry for queue: " + queueName, error);
-        } catch (Exception error) {
-            throw new RetrySchedulingException("Failed to schedule retry for queue: " + queueName, error);
         }
-        log.info("Async retry scheduled: queue: {}, failedAttempt: {}, nextAttempt: {}, delayMs: {}, messageId: {}, correlationId: {}",
+        log.info("Async retry scheduled: queue: {}, failedAttempt: {}, nextAttempt: {}, delayMs: {}, "
+                        + "messageId: {}, correlationId: {}",
                 queueName, attempt.getAttemptNumber(), nextState.attemptNumber(), delayMs,
                 properties == null ? null : properties.getMessageId(),
                 properties == null ? null : properties.getCorrelationId());

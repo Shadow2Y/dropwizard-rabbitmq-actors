@@ -16,9 +16,9 @@
 
 package io.appform.dropwizard.actors.retry.impl;
 
-import io.appform.dropwizard.actors.retry.ActorRetryerBuilder;
 import com.github.rholder.retry.StopStrategies;
 import com.github.rholder.retry.WaitStrategies;
+import io.appform.dropwizard.actors.retry.ActorRetryerBuilder;
 import io.appform.dropwizard.actors.retry.RetryStrategy;
 import io.appform.dropwizard.actors.retry.config.CountLimitedFixedWaitRetryConfig;
 import io.appform.dropwizard.actors.utils.CommonUtils;
@@ -35,6 +35,7 @@ public class CountLimitedFixedWaitRetryStrategy extends RetryStrategy {
                         exception))
                 .withStopStrategy(StopStrategies.stopAfterAttempt(config.getMaxAttempts()))
                 .withWaitStrategy(
-                        WaitStrategies.fixedWait(config.getWaitTime().toMilliseconds(), TimeUnit.MILLISECONDS)).build());
+                        WaitStrategies.fixedWait(config.getWaitTime().toMilliseconds(), TimeUnit.MILLISECONDS))
+                .build(), config.getRetryMode());
     }
 }

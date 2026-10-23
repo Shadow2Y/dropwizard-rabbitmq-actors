@@ -19,13 +19,17 @@ package io.appform.dropwizard.actors.retry.config;
 import com.fasterxml.jackson.annotation.JsonSubTypes;
 import com.fasterxml.jackson.annotation.JsonTypeInfo;
 import io.appform.dropwizard.actors.retry.RetryMode;
+import io.appform.dropwizard.actors.retry.RetryQueueScope;
 import io.appform.dropwizard.actors.retry.RetryType;
 import io.dropwizard.util.Duration;
+import io.dropwizard.validation.MinDuration;
 import lombok.Data;
 import lombok.EqualsAndHashCode;
 import lombok.ToString;
 
 import java.util.Set;
+import java.util.concurrent.TimeUnit;
+import javax.validation.constraints.Min;
 import javax.validation.constraints.NotNull;
 
 /**
@@ -49,6 +53,8 @@ import javax.validation.constraints.NotNull;
 @ToString
 public abstract class RetryConfig {
 
+    public static final int DEFAULT_ASYNC_MAX_DELAY_LEVELS = 25;
+
     private final RetryType type;
 
     private Set<String> retriableExceptions;
@@ -57,10 +63,17 @@ public abstract class RetryConfig {
     private RetryMode retryMode = RetryMode.SYNC;
 
     /**
-     * How long an ASYNC retry scheduler waits for scheduling a retry before.
+     * How long an ASYNC retry handoff waits for the broker to confirm the retry copy before requeueing the delivery.
      */
     @NotNull
+    @MinDuration(value = 1, unit = TimeUnit.MILLISECONDS)
     private Duration asyncConfirmTimeout = Duration.seconds(5);
+
+    @Min(1)
+    private int asyncMaxDelayLevels = DEFAULT_ASYNC_MAX_DELAY_LEVELS;
+
+    @NotNull
+    private RetryQueueScope asyncRetryQueueScope = RetryQueueScope.EXCHANGE;
 
     protected RetryConfig(RetryType type) {
         this.type = type;

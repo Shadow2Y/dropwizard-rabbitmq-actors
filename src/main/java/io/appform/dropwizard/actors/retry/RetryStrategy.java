@@ -16,25 +16,53 @@
 
 package io.appform.dropwizard.actors.retry;
 
-
-import lombok.Getter;
+import com.github.rholder.retry.Retryer;
 import com.rabbitmq.client.AMQP;
 import io.appform.dropwizard.actors.retry.async.ActorRetryer;
+import lombok.Getter;
 
 import java.util.Objects;
 import java.util.concurrent.Callable;
 
 /**
- * Defines retry policy and delegates execution to the executor bound by the factory.
+ * Defines retry policy, with synchronous execution unless the factory binds an executor.
  */
 public abstract class RetryStrategy {
 
+    interface SyncRetryer extends ActorRetryer {
+    }
+
+    /**
+     * Null for strategies built from a legacy {@link Retryer}.
+     */
     @Getter
     private final ActorRetryerBuilder.Policy<Boolean> policy;
-    private ActorRetryer actorRetryer;
+    private final RetryMode retryMode;
+    private final SyncRetryer syncRetryer;
+    private volatile ActorRetryer actorRetryer;
+
+    /**
+     * @deprecated supports only {@link RetryMode#SYNC}; pass an {@link ActorRetryerBuilder.Policy} instead.
+     */
+    @Deprecated
+    protected RetryStrategy(Retryer<Boolean> retryer) {
+        this.policy = null;
+        this.retryMode = RetryMode.SYNC;
+        this.syncRetryer = syncRetryer(Objects.requireNonNull(retryer, "retryer"));
+    }
 
     protected RetryStrategy(ActorRetryerBuilder.Policy<Boolean> policy) {
+        this(policy, RetryMode.SYNC);
+    }
+
+    protected RetryStrategy(ActorRetryerBuilder.Policy<Boolean> policy, RetryMode retryMode) {
         this.policy = Objects.requireNonNull(policy, "policy");
+        this.retryMode = Objects.requireNonNull(retryMode, "retryMode");
+        this.syncRetryer = retryMode == RetryMode.SYNC ? syncRetryer(policy.buildSyncRetryer()) : null;
+    }
+
+    static SyncRetryer syncRetryer(Retryer<Boolean> retryer) {
+        return (callable, queueName, body, properties) -> retryer.call(callable);
     }
 
     final void setActorRetryer(ActorRetryer actorRetryer) {
@@ -45,9 +73,20 @@ public abstract class RetryStrategy {
         this.actorRetryer = actorRetryer;
     }
 
+    public boolean execute(Callable<Boolean> callable) throws Exception {
+        if (retryMode == RetryMode.ASYNC) {
+            throw new UnsupportedOperationException(
+                    "ASYNC retries need the delivery; use execute(callable, queueName, body, properties)");
+        }
+        return retryer().call(callable, null, null, null);
+    }
+
     public boolean execute(Callable<Boolean> callable, String queueName, byte[] body,
                            AMQP.BasicProperties properties) throws Exception {
-        return retryer().call(callable, queueName, body, properties);
+        var retryer = retryer();
+        return retryMode == RetryMode.SYNC && retryer instanceof SyncRetryer
+                ? execute(callable)
+                : retryer.call(callable, queueName, body, properties);
     }
 
     public void start() throws Exception {
@@ -59,10 +98,14 @@ public abstract class RetryStrategy {
     }
 
     private ActorRetryer retryer() {
-        if (actorRetryer == null) {
-            throw new IllegalStateException("Retry executor must be bound by RetryStrategyFactory");
+        var bound = actorRetryer;
+        if (bound != null) {
+            return bound;
         }
-        return actorRetryer;
+        if (syncRetryer == null) {
+            throw new IllegalStateException("Async retry executor must be bound by RetryStrategyFactory");
+        }
+        return syncRetryer;
     }
 
 }

@@ -100,8 +100,8 @@ public class Handler<Message> extends DefaultConsumer {
             } else {
                 getChannel().basicReject(envelope.getDeliveryTag(), false);
             }
-        } catch (RetrySchedulingException failure) {
-            log.error("Retry handoff failed; re-queuing delivery", failure);
+        } catch (RetrySchedulingException t) {
+            log.error("Retry handoff failed; re-queuing delivery", t);
             getChannel().basicNack(envelope.getDeliveryTag(), false, true);
         } finally {
             synchronized (this) {
@@ -115,9 +115,9 @@ public class Handler<Message> extends DefaultConsumer {
                                     final AMQP.BasicProperties properties,
                                     final byte[] body) throws RetrySchedulingException {
         try {
-            val expired = isExpired(properties);
             val message = mapper.readValue(body, clazz);
-            Callable<Boolean> handleCallable = () -> handle(message, populateMessageMeta(envelope, properties), expired);
+            Callable<Boolean> handleCallable = () -> handle(message, populateMessageMeta(envelope, properties),
+                    isExpired(properties));
             return retryStrategy.execute(handleCallable, queueName, body, properties);
         } catch (RetrySchedulingException failure) {
             throw failure;
@@ -128,7 +128,15 @@ public class Handler<Message> extends DefaultConsumer {
 
     private boolean handleProcessingFailure(final Throwable failure) {
         log.error("Error processing message...", failure);
-        return Boolean.TRUE.equals(errorCheckFunction.apply(failure)) || exceptionHandler.handle();
+        if (Boolean.TRUE.equals(errorCheckFunction.apply(failure))) {
+            log.warn("Acknowledging message due to exception: ", failure);
+            return true;
+        }
+        if (exceptionHandler.handle()) {
+            log.warn("Acknowledging message due to exception handling strategy: ", failure);
+            return true;
+        }
+        return false;
     }
 
     public synchronized void awaitCompletion() throws InterruptedException {

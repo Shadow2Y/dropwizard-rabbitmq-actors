@@ -15,7 +15,9 @@ import io.appform.dropwizard.actors.connectivity.strategy.DefaultConnectionStrat
 import io.appform.dropwizard.actors.exceptionhandler.ExceptionHandlingFactory;
 import io.appform.dropwizard.actors.observers.TerminalRMQObserver;
 import io.appform.dropwizard.actors.retry.RetryMode;
+import io.appform.dropwizard.actors.retry.RetryQueueScope;
 import io.appform.dropwizard.actors.retry.RetryStrategyFactory;
+import io.appform.dropwizard.actors.retry.async.TtlRequeueRetryScheduler;
 import io.appform.dropwizard.actors.retry.config.CountLimitedFixedWaitRetryConfig;
 import io.dropwizard.util.Duration;
 import org.junit.jupiter.api.BeforeEach;
@@ -23,24 +25,30 @@ import org.junit.jupiter.api.Test;
 import org.mockito.invocation.Invocation;
 
 import java.io.IOException;
+import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
-import java.util.Set;
 import java.util.concurrent.CopyOnWriteArrayList;
-import java.util.stream.Collectors;
+import java.util.concurrent.Executors;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicReference;
 
+import static org.awaitility.Awaitility.await;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertSame;
+import static org.junit.jupiter.api.Assertions.assertTimeoutPreemptively;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.anyBoolean;
 import static org.mockito.ArgumentMatchers.anyLong;
 import static org.mockito.ArgumentMatchers.anyString;
+import static org.mockito.Mockito.doThrow;
 import static org.mockito.Mockito.lenient;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.mockingDetails;
 import static org.mockito.Mockito.never;
+import static org.mockito.Mockito.times;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
 
@@ -55,7 +63,6 @@ class AsyncRetryWiringTest {
     private static final String EXCHANGE = "wiring.exchange";
     private static final long WAIT_MS = 100L;
     private static final long CONFIRM_TIMEOUT_MS = 5000L;
-    private static final String RETRY_SUFFIX = "_RETRY_" + WAIT_MS;
 
     private static final String QUEUE = NamingUtils.queueName(PREFIX, NAME);
     private static final String QUEUE_0 = NamingUtils.getShardedQueueName(QUEUE, 0);
@@ -63,6 +70,9 @@ class AsyncRetryWiringTest {
     private static final String SIDELINE_QUEUE = NamingUtils.getSidelineProcessor(QUEUE);
     private static final String SIDELINE_EXCHANGE = NamingUtils.getSidelineProcessor(EXCHANGE);
     private static final String DLX = NamingUtils.getSideline(EXCHANGE);
+    private static final String WAITING_QUEUE = TtlRequeueRetryScheduler.waitingQueueName(EXCHANGE, "classic", WAIT_MS);
+    private static final String SIDELINE_WAITING_QUEUE =
+            TtlRequeueRetryScheduler.waitingQueueName(SIDELINE_EXCHANGE, "classic", WAIT_MS);
 
     private final List<Channel> allChannels = new CopyOnWriteArrayList<>();
     private final List<Channel> channels = new CopyOnWriteArrayList<>();
@@ -86,13 +96,13 @@ class AsyncRetryWiringTest {
         // rmqOpts computes real queue arguments through the actual queue type visitor
         lenient().when(connection.rmqOpts(any(ActorConfig.class))).thenAnswer(invocation -> {
             var config = invocation.<ActorConfig>getArgument(0);
-            return new java.util.HashMap<>(
+            return new HashMap<>(
                     config.getQueueType().handleConfig(new QueueTypeVisitorImpl(config)));
         });
         lenient().when(connection.rmqOpts(anyString(), any(ActorConfig.class))).thenAnswer(invocation -> {
             var deadLetterExchange = invocation.<String>getArgument(0);
             var config = invocation.<ActorConfig>getArgument(1);
-            var arguments = new java.util.HashMap<String, Object>(
+            var arguments = new HashMap<String, Object>(
                     config.getQueueType().handleConfig(new QueueTypeVisitorImpl(config)));
             arguments.put("x-dead-letter-exchange", deadLetterExchange);
             return arguments;
@@ -100,18 +110,18 @@ class AsyncRetryWiringTest {
         // topology helpers delegate to the shared topology channel so queue/binding arguments can be inspected
         lenient().doAnswer(invocation -> {
             var queueName = invocation.<String>getArgument(0);
-            var opts = invocation.<java.util.Map<String, Object>>getArgument(3);
+            var opts = invocation.<Map<String, Object>>getArgument(3);
             topologyChannel.queueDeclare(queueName, true, false, false, opts);
             topologyChannel.queueBind(queueName, invocation.getArgument(2), invocation.getArgument(1));
             return null;
-        }).when(connection).ensure(anyString(), anyString(), anyString(), any(java.util.Map.class));
+        }).when(connection).ensure(anyString(), anyString(), anyString(), any(Map.class));
         lenient().doAnswer(invocation -> {
             var queueName = invocation.<String>getArgument(0);
-            var opts = invocation.<java.util.Map<String, Object>>getArgument(2);
+            var opts = invocation.<Map<String, Object>>getArgument(2);
             topologyChannel.queueDeclare(queueName, true, false, false, opts);
             topologyChannel.queueBind(queueName, invocation.getArgument(1), queueName);
             return null;
-        }).when(connection).ensure(anyString(), anyString(), any(java.util.Map.class));
+        }).when(connection).ensure(anyString(), anyString(), any(Map.class));
         lenient().doAnswer(invocation -> {
             topologyChannel.queueBind(invocation.getArgument(0), invocation.getArgument(1), invocation.getArgument(2));
             return null;
@@ -245,13 +255,14 @@ class AsyncRetryWiringTest {
         return (Map<String, Object>) invocation.getArgument(4);
     }
 
-    private Channel publishChannelOf(String exchange) {
+    private Channel publishChannelOf(String exchange, String routingKey) {
         return channels.stream()
                 .filter(channel -> mockingDetails(channel).getInvocations().stream()
                         .anyMatch(invocation -> invocation.getMethod().getName().equals("basicPublish")
-                                && exchange.equals(invocation.getArgument(0))))
+                                && exchange.equals(invocation.getArgument(0))
+                                && routingKey.equals(invocation.getArgument(1))))
                 .findFirst()
-                .orElseThrow(() -> new AssertionError("No publish channel for exchange " + exchange));
+                .orElseThrow(() -> new AssertionError("No publish channel for " + exchange + " -> " + routingKey));
     }
 
     private ShutdownListener shutdownListenerOn(Channel channel) {
@@ -263,7 +274,7 @@ class AsyncRetryWiringTest {
     }
 
     @Test
-    void failingDeliveriesAreHandedOffToLazyTtlRetryQueuesForMainAndSidelineConsumers() throws Exception {
+    void mainAndSidelineConsumersRetryThroughWaitingQueuesOfTheirOwnExchange() throws Exception {
         var actor = startActor(actorConfig(asyncRetry(3), true, null, sidelineConfig()));
 
         var main = consumerOn(QUEUE);
@@ -279,30 +290,21 @@ class AsyncRetryWiringTest {
         assertEquals("lazy", mainArgs.get("x-queue-mode"));
         assertEquals(DLX, mainArgs.get("x-dead-letter-exchange"));
 
-        // main consumer: failing delivery is handed off to a lazy TTL retry queue and acked
+        var waitingDeclare = single(withFirstArg(callsNamed("queueDeclare"), WAITING_QUEUE));
+        assertEquals(Boolean.TRUE, waitingDeclare.getArgument(1));
+        assertEquals(Map.of("x-queue-type", "classic", "x-message-ttl", WAIT_MS, "x-dead-letter-exchange", EXCHANGE),
+                declaredArguments(waitingDeclare));
+        assertEquals(Map.of("x-queue-type", "classic", "x-message-ttl", WAIT_MS,
+                        "x-dead-letter-exchange", SIDELINE_EXCHANGE),
+                declaredArguments(single(withFirstArg(callsNamed("queueDeclare"), SIDELINE_WAITING_QUEUE))));
+        assertEquals("fanout", single(withFirstArg(callsNamed("exchangeDeclare"), WAITING_QUEUE)).getArgument(1));
+        assertEquals(WAITING_QUEUE, single(withFirstArg(callsNamed("queueBind"), WAITING_QUEUE)).getArgument(1));
+
         deliverFailingMessage(main, 11L);
         verify(main.channel()).basicAck(11L, false);
         verify(main.channel(), never()).basicReject(anyLong(), anyBoolean());
 
-        var retryQueue = QUEUE + RETRY_SUFFIX;
-        var retryExchange = EXCHANGE + RETRY_SUFFIX;
-        var retryDeclare = single(withFirstArg(callsNamed("queueDeclare"), retryQueue));
-        assertEquals(Boolean.TRUE, retryDeclare.getArgument(1));
-        assertEquals(Boolean.FALSE, retryDeclare.getArgument(3));
-        var retryArgs = declaredArguments(retryDeclare);
-        assertEquals(WAIT_MS, ((Number) retryArgs.get("x-message-ttl")).longValue());
-        assertEquals(EXCHANGE, retryArgs.get("x-dead-letter-exchange"));
-        assertEquals("lazy", retryArgs.get("x-queue-mode"));
-        assertEquals("classic", retryArgs.get("x-queue-type"));
-        assertEquals(5, retryArgs.size());
-        var retryExchangeDeclare = single(withFirstArg(callsNamed("exchangeDeclare"), retryExchange));
-        assertEquals("direct", retryExchangeDeclare.getArgument(1));
-        assertEquals(Boolean.TRUE, retryExchangeDeclare.getArgument(2));
-        var retryBinding = single(withFirstArg(callsNamed("queueBind"), retryQueue));
-        assertEquals(retryExchange, retryBinding.getArgument(1));
-        assertEquals(QUEUE, retryBinding.getArgument(2));
-
-        var publish = single(withFirstArg(callsNamed("basicPublish"), retryExchange));
+        var publish = single(withFirstArg(callsNamed("basicPublish"), WAITING_QUEUE));
         assertEquals(QUEUE, publish.getArgument(1));
         assertEquals(Boolean.TRUE, publish.getArgument(2));
         var properties = (AMQP.BasicProperties) publish.getArgument(3);
@@ -312,21 +314,31 @@ class AsyncRetryWiringTest {
         var startedAt = ((Number) properties.getHeaders().get("x-actor-retry-started-at")).longValue();
         assertTrue(startedAt > 0 && startedAt <= System.currentTimeMillis());
         assertSame(body, publish.getArgument(4));
-        verify(publishChannelOf(retryExchange)).waitForConfirmsOrDie(CONFIRM_TIMEOUT_MS);
+        verify(publishChannelOf(WAITING_QUEUE, QUEUE)).waitForConfirmsOrDie(CONFIRM_TIMEOUT_MS);
 
-        // sideline processor consumer: exact sideline destinations for its own async retry
         deliverFailingMessage(sideline, 12L);
         verify(sideline.channel()).basicAck(12L, false);
+        verify(publishChannelOf(SIDELINE_WAITING_QUEUE, SIDELINE_QUEUE)).waitForConfirmsOrDie(CONFIRM_TIMEOUT_MS);
 
-        var sidelineRetryQueue = SIDELINE_QUEUE + RETRY_SUFFIX;
-        var sidelineRetryExchange = SIDELINE_EXCHANGE + RETRY_SUFFIX;
-        var sidelineRetryArgs = declaredArguments(
-                single(withFirstArg(callsNamed("queueDeclare"), sidelineRetryQueue)));
-        assertEquals(WAIT_MS, ((Number) sidelineRetryArgs.get("x-message-ttl")).longValue());
-        assertEquals(SIDELINE_EXCHANGE, sidelineRetryArgs.get("x-dead-letter-exchange"));
-        var sidelinePublish = single(withFirstArg(callsNamed("basicPublish"), sidelineRetryExchange));
-        assertEquals(SIDELINE_QUEUE, sidelinePublish.getArgument(1));
-        verify(publishChannelOf(sidelineRetryExchange)).waitForConfirmsOrDie(CONFIRM_TIMEOUT_MS);
+        actor.stop();
+    }
+
+    @Test
+    void queueScopeGivesTheConsumerItsOwnWaitingQueue() throws Exception {
+        var retry = asyncRetry(3);
+        retry.setAsyncRetryQueueScope(RetryQueueScope.QUEUE);
+        var actor = startActor(actorConfig(retry, false, null, null));
+        var waitingQueue = QUEUE + "_RETRY_" + WAIT_MS;
+
+        assertEquals(Map.of("x-queue-type", "classic", "x-message-ttl", WAIT_MS, "x-dead-letter-exchange", EXCHANGE),
+                declaredArguments(single(withFirstArg(callsNamed("queueDeclare"), waitingQueue))));
+        assertTrue(withFirstArg(callsNamed("queueDeclare"), WAITING_QUEUE).isEmpty());
+
+        var main = consumerOn(QUEUE);
+        deliverFailingMessage(main, 61L);
+
+        verify(main.channel()).basicAck(61L, false);
+        assertEquals(QUEUE, single(withFirstArg(callsNamed("basicPublish"), waitingQueue)).getArgument(1));
 
         actor.stop();
     }
@@ -341,14 +353,27 @@ class AsyncRetryWiringTest {
         verify(main.channel()).basicReject(21L, false);
         verify(main.channel(), never()).basicAck(anyLong(), anyBoolean());
         assertTrue(callsNamed("confirmSelect").isEmpty());
-        assertTrue(withFirstArg(callsNamed("queueDeclare"), QUEUE + RETRY_SUFFIX).isEmpty());
-        assertTrue(withFirstArg(callsNamed("exchangeDeclare"), EXCHANGE + RETRY_SUFFIX).isEmpty());
-        assertTrue(withFirstArg(callsNamed("basicPublish"), EXCHANGE + RETRY_SUFFIX).isEmpty());
+        assertTrue(withFirstArg(callsNamed("queueDeclare"), WAITING_QUEUE).isEmpty());
+        assertTrue(withFirstArg(callsNamed("exchangeDeclare"), WAITING_QUEUE).isEmpty());
+        assertTrue(withFirstArg(callsNamed("basicPublish"), WAITING_QUEUE).isEmpty());
     }
 
     @Test
-    void shardedActorsRetryIntoPerShardDestinations() throws Exception {
-        startActor(actorConfig(asyncRetry(2), false, 2, null));
+    void retryTopologyIsDeclaredWhenTheActorStartsBeforeAnyFailure() throws Exception {
+        var actor = startActor(actorConfig(asyncRetry(3), false, null, null));
+
+        assertEquals("fanout", single(withFirstArg(callsNamed("exchangeDeclare"), WAITING_QUEUE)).getArgument(1));
+        var waitingArgs = declaredArguments(single(withFirstArg(callsNamed("queueDeclare"), WAITING_QUEUE)));
+        assertEquals(WAIT_MS, ((Number) waitingArgs.get("x-message-ttl")).longValue());
+        assertTrue(withFirstArg(callsNamed("basicPublish"), WAITING_QUEUE).isEmpty());
+        assertTrue(callsNamed("confirmSelect").isEmpty());
+
+        actor.stop();
+    }
+
+    @Test
+    void shardedActorsRetryThroughOneWaitingQueueBackToTheFailingShard() throws Exception {
+        var actor = startActor(actorConfig(asyncRetry(2), false, 2, null));
 
         var shardZero = consumerOn(QUEUE_0);
         var shardOne = consumerOn(QUEUE_1);
@@ -356,16 +381,45 @@ class AsyncRetryWiringTest {
 
         verify(shardOne.channel()).basicAck(31L, false);
         verify(shardZero.channel(), never()).basicAck(anyLong(), anyBoolean());
+        assertEquals("", single(withFirstArg(callsNamed("queueBind"), WAITING_QUEUE)).getArgument(2));
+        assertEquals(QUEUE_1, single(withFirstArg(callsNamed("basicPublish"), WAITING_QUEUE)).getArgument(1));
 
-        var retryQueue = QUEUE + RETRY_SUFFIX;
-        var retryExchange = EXCHANGE + RETRY_SUFFIX;
-        var bindings = withFirstArg(callsNamed("queueBind"), retryQueue);
-        assertEquals(2, bindings.size());
-        var boundKeys = bindings.stream()
-                .map(invocation -> (String) invocation.getArgument(2))
-                .collect(Collectors.toSet());
-        assertEquals(Set.of(QUEUE_0, QUEUE_1), boundKeys);
-        assertEquals(QUEUE_1, single(withFirstArg(callsNamed("basicPublish"), retryExchange)).getArgument(1));
+        actor.stop();
+    }
+
+    @Test
+    void consumerStopWakesTransportCooldownBeforeDrainingHandlers() throws Exception {
+        var actor = startActor(actorConfig(asyncRetry(3), false, null, null));
+        var main = consumerOn(QUEUE);
+        deliverFailingMessage(main, 51L);
+        var publisher = publishChannelOf(WAITING_QUEUE, QUEUE);
+        doThrow(new IOException("broker unavailable"))
+                .when(publisher).waitForConfirmsOrDie(CONFIRM_TIMEOUT_MS);
+        deliverFailingMessage(main, 52L);
+        var worker = new AtomicReference<Thread>();
+        var executor = Executors.newSingleThreadExecutor();
+        try {
+            var delivery = executor.submit(() -> {
+                worker.set(Thread.currentThread());
+                deliverFailingMessage(main, 53L);
+                return null;
+            });
+            await().atMost(500, TimeUnit.MILLISECONDS).until(() ->
+                    worker.get() != null && worker.get().getState() == Thread.State.TIMED_WAITING
+                            && main.handler().isRunning());
+
+            assertTimeoutPreemptively(java.time.Duration.ofMillis(500), actor::stop);
+            delivery.get(500, TimeUnit.MILLISECONDS);
+
+            verify(main.channel()).basicNack(52L, false, true);
+            verify(main.channel()).basicNack(53L, false, true);
+            verify(main.channel()).basicCancel(main.tag());
+            verify(main.channel()).close();
+            verify(publisher, times(2)).basicPublish(anyString(), anyString(), anyBoolean(), any(), any());
+        } finally {
+            actor.stop();
+            executor.shutdownNow();
+        }
     }
 
     @Test
@@ -375,7 +429,7 @@ class AsyncRetryWiringTest {
         var main = consumerOn(QUEUE);
         var sideline = consumerOn(SIDELINE_QUEUE);
         deliverFailingMessage(main, 41L);
-        var schedulerChannel = publishChannelOf(EXCHANGE + RETRY_SUFFIX);
+        var schedulerChannel = publishChannelOf(WAITING_QUEUE, QUEUE);
         var publisherChannel = channels.get(0);
         var consumersBefore = callsNamed("basicConsume").size();
         var channelsBefore = allChannels.size();

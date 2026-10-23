@@ -65,7 +65,7 @@ public class AsyncRetryIntegrationTest {
     private static final String RETRY_ATTEMPT_HEADER = "x-actor-retry-attempt";
     private static final String RETRY_STARTED_AT_HEADER = "x-actor-retry-started-at";
 
-    private static RMQConnection connection;
+    private RMQConnection connection;
     private final ObjectMapper mapper = new ObjectMapper();
 
     static class TestMessage {
