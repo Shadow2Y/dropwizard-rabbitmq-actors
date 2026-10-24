@@ -26,7 +26,6 @@ import io.appform.dropwizard.actors.retry.async.TtlRequeueRetryScheduler;
 import io.appform.dropwizard.actors.retry.config.CountLimitedExponentialWaitRetryConfig;
 import io.appform.dropwizard.actors.retry.config.CountLimitedFixedWaitRetryConfig;
 import io.appform.dropwizard.actors.retry.config.CountLimitedIncrementalWaitRetryConfig;
-import io.appform.dropwizard.actors.retry.config.NoRetryConfig;
 import io.appform.dropwizard.actors.retry.config.RetryConfig;
 import io.appform.dropwizard.actors.retry.config.TimeLimitedExponentialWaitRetryConfig;
 import io.appform.dropwizard.actors.retry.config.TimeLimitedFixedWaitRetryConfig;
@@ -55,14 +54,20 @@ public class RetryStrategyFactory {
     }
 
     public RetryStrategy create(ActorConfig actorConfig, RMQConnection connection, String queueName) {
-        var retryMode = actorConfig.getRetryConfig().getWaitMode();
-        var strategy = createStrategy(actorConfig.getRetryConfig());
+        return create(actorConfig.getRetryConfig(), actorConfig, connection, actorConfig.getExchange(), queueName);
+    }
+
+    public RetryStrategy create(RetryConfig retryConfig, ActorConfig actorConfig, RMQConnection connection,
+                                String exchange, String queueName) {
+        var retryMode = retryConfig.getWaitMode();
+        var strategy = createStrategy(retryConfig);
         if (retryMode == null || retryMode == WaitMode.SYNC) {
             return strategy;
         }
         var retryPolicy = Objects.requireNonNull(strategy.getRetryPolicy(), "retryPolicy");
         var actorRetryer = new AsyncRetryer(retryPolicy,
-            new TtlRequeueRetryScheduler(connection, retryPolicy, actorConfig, "", new PublishingChannel(connection, 2000))
+            new TtlRequeueRetryScheduler(connection, retryPolicy, actorConfig, exchange,
+                    new PublishingChannel(connection, 2000))
         );
         return strategy.setActorRetryer(actorRetryer);
     }

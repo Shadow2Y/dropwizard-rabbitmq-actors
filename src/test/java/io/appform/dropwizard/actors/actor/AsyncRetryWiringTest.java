@@ -1,6 +1,5 @@
 package io.appform.dropwizard.actors.actor;
 
-import static org.awaitility.Awaitility.await;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertSame;
@@ -33,10 +32,8 @@ import io.appform.dropwizard.actors.connectivity.RMQConnection;
 import io.appform.dropwizard.actors.connectivity.strategy.DefaultConnectionStrategy;
 import io.appform.dropwizard.actors.exceptionhandler.ExceptionHandlingFactory;
 import io.appform.dropwizard.actors.observers.TerminalRMQObserver;
-import io.appform.dropwizard.actors.retry.RetryMode;
+import io.appform.dropwizard.actors.retry.WaitMode;
 import io.appform.dropwizard.actors.retry.RetryStrategyFactory;
-import io.appform.dropwizard.actors.retry.async.TtlRequeueRetryScheduler;
-import io.appform.dropwizard.actors.retry.async.TtlRequeueRetryScheduler.RetryQueueIsolation;
 import io.appform.dropwizard.actors.retry.config.CountLimitedFixedWaitRetryConfig;
 import io.dropwizard.util.Duration;
 import java.io.IOException;
@@ -44,9 +41,6 @@ import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.concurrent.CopyOnWriteArrayList;
-import java.util.concurrent.Executors;
-import java.util.concurrent.TimeUnit;
-import java.util.concurrent.atomic.AtomicReference;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.mockito.invocation.Invocation;
@@ -61,7 +55,7 @@ class AsyncRetryWiringTest {
     private static final String PREFIX = "test.prefix";
     private static final String EXCHANGE = "wiring.exchange";
     private static final long WAIT_MS = 100L;
-    private static final long CONFIRM_TIMEOUT_MS = 5000L;
+    private static final long CONFIRM_TIMEOUT_MS = 2000L;
 
     private static final String QUEUE = NamingUtils.queueName(PREFIX, NAME);
     private static final String QUEUE_0 = NamingUtils.getShardedQueueName(QUEUE, 0);
@@ -69,9 +63,10 @@ class AsyncRetryWiringTest {
     private static final String SIDELINE_QUEUE = NamingUtils.getSidelineProcessor(QUEUE);
     private static final String SIDELINE_EXCHANGE = NamingUtils.getSidelineProcessor(EXCHANGE);
     private static final String DLX = NamingUtils.getSideline(EXCHANGE);
-    private static final String WAITING_QUEUE = TtlRequeueRetryScheduler.waitingQueueName(EXCHANGE, "classic", WAIT_MS);
+    private static final String WAITING_QUEUE =
+            NamingUtils.prefixWithNamespace(EXCHANGE + "_RETRY_classic_" + WAIT_MS);
     private static final String SIDELINE_WAITING_QUEUE =
-            TtlRequeueRetryScheduler.waitingQueueName(SIDELINE_EXCHANGE, "classic", WAIT_MS);
+            NamingUtils.prefixWithNamespace(SIDELINE_EXCHANGE + "_RETRY_classic_" + WAIT_MS);
 
     private final List<Channel> allChannels = new CopyOnWriteArrayList<>();
     private final List<Channel> channels = new CopyOnWriteArrayList<>();
@@ -151,7 +146,7 @@ class AsyncRetryWiringTest {
 
     private CountLimitedFixedWaitRetryConfig asyncRetry(int maxAttempts) {
         var retry = new CountLimitedFixedWaitRetryConfig();
-        retry.setRetryMode(RetryMode.ASYNC);
+        retry.setWaitMode(WaitMode.ASYNC);
         retry.setMaxAttempts(maxAttempts);
         retry.setWaitTime(Duration.milliseconds(WAIT_MS));
         return retry;
@@ -323,23 +318,23 @@ class AsyncRetryWiringTest {
     }
 
     @Test
-    void queueScopeGivesTheConsumerItsOwnWaitingQueue() throws Exception {
-        var retry = asyncRetry(3);
-        retry.setScope(RetryQueueIsolation.QUEUE);
-        var actor = startActor(actorConfig(retry, false, null, null));
-        var waitingQueue = QUEUE + "_RETRY_" + WAIT_MS;
+    void sidelineRetryBudgetIsIndependentOfMainConsumer() throws Exception {
+        var sidelineConfig = sidelineConfig();
+        sidelineConfig.setRetryConfig(asyncRetry(1));
+        var actor = startActor(actorConfig(asyncRetry(3), false, null, sidelineConfig));
+        try {
+            var main = consumerOn(QUEUE);
+            var sideline = consumerOn(SIDELINE_QUEUE);
+            deliverFailingMessage(main, 61L);
+            deliverFailingMessage(sideline, 62L);
 
-        assertEquals(Map.of("x-queue-type", "classic", "x-message-ttl", WAIT_MS, "x-dead-letter-exchange", EXCHANGE),
-                declaredArguments(single(withFirstArg(callsNamed("queueDeclare"), waitingQueue))));
-        assertTrue(withFirstArg(callsNamed("queueDeclare"), WAITING_QUEUE).isEmpty());
-
-        var main = consumerOn(QUEUE);
-        deliverFailingMessage(main, 61L);
-
-        verify(main.channel()).basicAck(61L, false);
-        assertEquals(QUEUE, single(withFirstArg(callsNamed("basicPublish"), waitingQueue)).getArgument(1));
-
-        actor.stop();
+            verify(main.channel()).basicAck(61L, false);
+            verify(sideline.channel()).basicReject(62L, false);
+            assertEquals(QUEUE, single(withFirstArg(callsNamed("basicPublish"), WAITING_QUEUE)).getArgument(1));
+            assertTrue(withFirstArg(callsNamed("queueDeclare"), SIDELINE_WAITING_QUEUE).isEmpty());
+        } finally {
+            actor.stop();
+        }
     }
 
     @Test
@@ -387,37 +382,25 @@ class AsyncRetryWiringTest {
     }
 
     @Test
-    void consumerStopWakesTransportCooldownBeforeDrainingHandlers() throws Exception {
+    void consumerStopsAfterFailedRetryHandoff() throws Exception {
         var actor = startActor(actorConfig(asyncRetry(3), false, null, null));
         var main = consumerOn(QUEUE);
         deliverFailingMessage(main, 51L);
         var publisher = publishChannelOf(WAITING_QUEUE, QUEUE);
         doThrow(new IOException("broker unavailable"))
                 .when(publisher).waitForConfirmsOrDie(CONFIRM_TIMEOUT_MS);
-        deliverFailingMessage(main, 52L);
-        var worker = new AtomicReference<Thread>();
-        var executor = Executors.newSingleThreadExecutor();
         try {
-            var delivery = executor.submit(() -> {
-                worker.set(Thread.currentThread());
-                deliverFailingMessage(main, 53L);
-                return null;
-            });
-            await().atMost(500, TimeUnit.MILLISECONDS).until(() ->
-                    worker.get() != null && worker.get().getState() == Thread.State.TIMED_WAITING
-                            && main.handler().isRunning());
-
+            org.junit.jupiter.api.Assertions.assertThrows(
+                    io.appform.dropwizard.actors.retry.async.RetrySchedulingException.class,
+                    () -> deliverFailingMessage(main, 52L));
             assertTimeoutPreemptively(java.time.Duration.ofMillis(500), actor::stop);
-            delivery.get(500, TimeUnit.MILLISECONDS);
 
-            verify(main.channel()).basicNack(52L, false, true);
-            verify(main.channel()).basicNack(53L, false, true);
+            verify(main.channel(), never()).basicNack(anyLong(), anyBoolean(), anyBoolean());
             verify(main.channel()).basicCancel(main.tag());
             verify(main.channel()).close();
             verify(publisher, times(2)).basicPublish(anyString(), anyString(), anyBoolean(), any(), any());
         } finally {
             actor.stop();
-            executor.shutdownNow();
         }
     }
 

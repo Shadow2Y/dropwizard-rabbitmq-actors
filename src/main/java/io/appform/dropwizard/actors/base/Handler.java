@@ -19,7 +19,6 @@ import io.appform.dropwizard.actors.retry.RetryStrategy;
 import io.appform.dropwizard.actors.retry.async.RetrySchedulingException;
 import java.io.IOException;
 import java.time.Instant;
-import java.util.concurrent.Callable;
 import java.util.function.Function;
 import lombok.Getter;
 import lombok.Setter;
@@ -94,10 +93,17 @@ public class Handler<Message> extends DefaultConsumer {
                                final AMQP.BasicProperties properties,
                                final byte[] body) throws IOException {
         running = true;
-        if (processDelivery(envelope, properties, body)) {
-            getChannel().basicAck(envelope.getDeliveryTag(), false);
-        } else {
-            getChannel().basicReject(envelope.getDeliveryTag(), false);
+        try {
+            if (processDelivery(envelope, properties, body)) {
+                getChannel().basicAck(envelope.getDeliveryTag(), false);
+            } else {
+                getChannel().basicReject(envelope.getDeliveryTag(), false);
+            }
+        } finally {
+            synchronized (this) {
+                running = false;
+                notifyAll();
+            }
         }
     }
 

@@ -20,7 +20,8 @@ public interface AsyncRetryScheduler {
 
     /**
      * Completes the retry handoff before returning. Permanent rejections should throw
-     * {@link RetrySchedulingRejectedException}; other exceptions requeue the original delivery.
+     * {@link RetrySchedulingRejectedException}. Transport failures should throw
+     * {@link RetrySchedulingException}, which propagates without settling the original delivery.
      */
     void schedule(String queueName, byte[] body, AMQP.BasicProperties properties,
                   RetryState nextState, long delayMs) throws Exception;

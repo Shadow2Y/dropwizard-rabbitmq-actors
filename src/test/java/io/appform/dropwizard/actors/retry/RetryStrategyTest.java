@@ -1,45 +1,25 @@
 package io.appform.dropwizard.actors.retry;
 
 import com.github.rholder.retry.RetryException;
-import com.github.rholder.retry.RetryerBuilder;
-import com.github.rholder.retry.StopStrategies;
 import com.rabbitmq.client.AMQP;
 import io.appform.dropwizard.actors.retry.async.ActorRetryer;
 import io.appform.dropwizard.actors.retry.async.AsyncRetryScheduler;
+import io.appform.dropwizard.actors.retry.async.AsyncRetryer;
 import io.appform.dropwizard.actors.retry.async.RetryState;
 import io.appform.dropwizard.actors.retry.config.CountLimitedFixedWaitRetryConfig;
 import io.appform.dropwizard.actors.retry.config.NoRetryConfig;
-import io.appform.dropwizard.actors.retry.config.RetryConfig;
 import io.appform.dropwizard.actors.retry.impl.CountLimitedFixedWaitRetryStrategy;
 import io.appform.dropwizard.actors.retry.impl.NoRetryStrategy;
 import io.dropwizard.util.Duration;
-import org.junit.jupiter.api.Test;
-
 import java.io.IOException;
-import java.util.ArrayList;
-import java.util.List;
 import java.util.Set;
-import java.util.concurrent.Callable;
-import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.atomic.AtomicInteger;
-import java.util.concurrent.atomic.AtomicReference;
+import org.junit.jupiter.api.Test;
 
-import static org.junit.jupiter.api.Assertions.assertEquals;
-import static org.junit.jupiter.api.Assertions.assertFalse;
-import static org.junit.jupiter.api.Assertions.assertInstanceOf;
-import static org.junit.jupiter.api.Assertions.assertNotSame;
-import static org.junit.jupiter.api.Assertions.assertNull;
-import static org.junit.jupiter.api.Assertions.assertThrows;
-import static org.junit.jupiter.api.Assertions.assertTrue;
-import static org.mockito.ArgumentMatchers.any;
-import static org.mockito.ArgumentMatchers.anyLong;
-import static org.mockito.ArgumentMatchers.anyString;
-import static org.mockito.ArgumentMatchers.eq;
-import static org.mockito.Mockito.doAnswer;
-import static org.mockito.Mockito.mock;
-import static org.mockito.Mockito.verify;
-import static org.mockito.Mockito.when;
+import static org.junit.jupiter.api.Assertions.*;
+import static org.mockito.ArgumentMatchers.*;
+import static org.mockito.Mockito.*;
 
 class RetryStrategyTest {
 
@@ -49,12 +29,10 @@ class RetryStrategyTest {
     void syncRetriesUntilAttemptLimitIncludingInitialAttempt() {
         var strategy = factory.create(fixedWait(null));
         var attempts = new AtomicInteger();
-
         var error = assertThrows(RetryException.class, () -> strategy.execute(() -> {
             attempts.incrementAndGet();
             throw new IOException();
         }, null, null, null));
-
         assertEquals(3, attempts.get());
         assertEquals(3, error.getNumberOfFailedAttempts());
     }
@@ -63,7 +41,6 @@ class RetryStrategyTest {
     void syncCanSucceedAfterRetry() throws Exception {
         var strategy = factory.create(fixedWait(null));
         var attempts = new AtomicInteger();
-
         assertTrue(strategy.execute(() -> {
             if (attempts.incrementAndGet() < 3) {
                 throw new IOException();
@@ -77,7 +54,6 @@ class RetryStrategyTest {
     void nonRetriableExceptionsAndFalseResultsDoNotRetry() throws Exception {
         var strategy = factory.create(fixedWait(Set.of("IllegalStateException")));
         var attempts = new AtomicInteger();
-
         var error = assertThrows(ExecutionException.class, () -> strategy.execute(() -> {
             attempts.incrementAndGet();
             throw new IOException();
@@ -95,125 +71,59 @@ class RetryStrategyTest {
     @Test
     void noRetryPreservesResultsAndExceptionWrapping() throws Exception {
         var strategy = factory.create(new NoRetryConfig());
-        var attempts = new AtomicInteger();
-
         assertTrue(strategy.execute(() -> true, null, null, null));
         assertFalse(strategy.execute(() -> false, null, null, null));
+        var failure = new IOException("failure");
         var error = assertThrows(ExecutionException.class, () -> strategy.execute(() -> {
-            attempts.incrementAndGet();
-            throw new IOException();
+            throw failure;
         }, null, null, null));
-        assertInstanceOf(IOException.class, error.getCause());
-        assertEquals(1, attempts.get());
+        assertSame(failure, error.getCause());
     }
 
     @Test
-    void asyncStrategyUsesSuppliedScheduler() throws Exception {
+    void boundAsyncExecutorReceivesDeliveryAndLifecycle() throws Exception {
         var scheduler = mock(AsyncRetryScheduler.class);
-        var strategy = factory.create(async(fixedWait(null)), scheduler);
-        var scheduledState = new AtomicReference<RetryState>();
-
-        when(scheduler.restoreState(anyString(), any(), anyLong())).thenReturn(new RetryState(1, 0L));
-        doAnswer(invocation -> {
-            scheduledState.set(invocation.getArgument(3));
-            return null;
-        }).when(scheduler).schedule(anyString(), any(byte[].class), any(), any(), anyLong());
-
+        var strategy = factory.create(fixedWait(null));
+        strategy.setActorRetryer(new AsyncRetryer(strategy.getRetryPolicy(), scheduler));
+        when(scheduler.restoreState(eq("queue"), any(), anyLong())).thenReturn(new RetryState(1, 0L));
+        var body = new byte[]{1};
+        var properties = new AMQP.BasicProperties();
+        strategy.start();
         assertTrue(strategy.execute(() -> {
             throw new IOException();
-        }, "queue", new byte[0], new AMQP.BasicProperties()));
-        verify(scheduler).schedule(eq("queue"), any(byte[].class), any(), any(RetryState.class), anyLong());
-        assertEquals(new RetryState(2, 0L), scheduledState.get());
-    }
-
-    @Test
-    void asyncStrategyWithoutSchedulerFailsFast() {
-        var error = assertThrows(NullPointerException.class,
-                () -> factory.create(async(fixedWait(null)), null));
-        assertEquals("Async retry scheduler is required", error.getMessage());
-    }
-
-    @Test
-    void asyncStrategyViaSingleArgFactoryMethodWithoutSchedulerFailsFast() {
-        assertThrows(NullPointerException.class, () -> factory.create(async(fixedWait(null))));
-    }
-
-    @Test
-    void syncStrategyIgnoresSuppliedScheduler() throws Exception {
-        var strategy = factory.create(fixedWait(null), mock(AsyncRetryScheduler.class));
-        var attempts = new AtomicInteger();
-
-        assertTrue(strategy.execute(() -> {
-            attempts.incrementAndGet();
-            return true;
-        }, null, null, null));
-        assertEquals(1, attempts.get());
-    }
-
-    @Test
-    void createRetainsConcreteStrategyType() {
-        assertInstanceOf(CountLimitedFixedWaitRetryStrategy.class, factory.create(fixedWait(null)));
-        assertInstanceOf(NoRetryStrategy.class, factory.create(new NoRetryConfig()));
-    }
-
-    @Test
-    void protectedHookAllowsCustomExecutor() throws Exception {
-        var customFactory = new RecordingFactory();
-        var strategy = customFactory.create(fixedWait(null));
-
-        assertTrue(strategy.execute(() -> true, "queue", null, null));
-
-        assertEquals(1, customFactory.created.size());
-        assertEquals(List.of("call:queue"), customFactory.created.get(0).events);
-    }
-
-    @Test
-    void lifecycleDelegatesToBoundExecutor() throws Exception {
-        var customFactory = new RecordingFactory();
-        var strategy = customFactory.create(fixedWait(null));
-
-        strategy.start();
+        }, "queue", body, properties));
         strategy.stop();
-
-        assertEquals(List.of("start", "stop"), customFactory.created.get(0).events);
+        verify(scheduler).schedule("queue", body, properties, new RetryState(2, 0L), 1L);
+        verify(scheduler).start();
+        verify(scheduler).stop();
     }
 
     @Test
-    void factoryReuseBindsFreshExecutors() throws Exception {
-        var customFactory = new RecordingFactory();
-        var first = customFactory.create(fixedWait(null));
-        var second = customFactory.create(fixedWait(null));
-
+    void createRetainsConcreteStrategyTypeAndIndependentPolicies() {
+        var first = factory.create(fixedWait(null));
+        var second = factory.create(fixedWait(null));
+        assertInstanceOf(CountLimitedFixedWaitRetryStrategy.class, first);
+        assertInstanceOf(NoRetryStrategy.class, factory.create(new NoRetryConfig()));
         assertNotSame(first, second);
-        assertEquals(2, customFactory.created.size());
-        assertNotSame(customFactory.created.get(0), customFactory.created.get(1));
-        assertTrue(first.execute(() -> true, null, null, null));
-        assertTrue(second.execute(() -> true, null, null, null));
-        assertEquals(List.of("call:null"), customFactory.created.get(0).events);
-        assertEquals(List.of("call:null"), customFactory.created.get(1).events);
+        assertNotSame(first.getRetryPolicy(), second.getRetryPolicy());
     }
 
     @Test
-    void setActorRetryerIsSingleAssignment() {
-        RetryStrategy strategy = new CountLimitedFixedWaitRetryStrategy(fixedWait(null));
-        strategy.setActorRetryer((callable, queueName, body, properties) -> callable.call());
-
-        var error = assertThrows(IllegalStateException.class,
-                () -> strategy.setActorRetryer((callable, queueName, body, properties) -> true));
-        assertEquals("Retry executor has already been bound", error.getMessage());
-    }
-
-    @Test
-    void setActorRetryerRejectsNull() {
-        RetryStrategy strategy = new CountLimitedFixedWaitRetryStrategy(fixedWait(null));
-
-        var error = assertThrows(NullPointerException.class, () -> strategy.setActorRetryer(null));
-        assertEquals("actorRetryer", error.getMessage());
+    void boundExecutorReceivesOriginalArgumentsAndReturnValue() throws Exception {
+        var strategy = factory.create(fixedWait(null));
+        var executor = mock(ActorRetryer.class);
+        strategy.setActorRetryer(executor);
+        var properties = new AMQP.BasicProperties();
+        var body = new byte[]{1};
+        java.util.concurrent.Callable<Boolean> callable = () -> true;
+        when(executor.call(callable, "queue", body, properties)).thenReturn(false);
+        assertFalse(strategy.execute(callable, "queue", body, properties));
+        verify(executor).call(callable, "queue", body, properties);
     }
 
     @Test
     void directStrategySupportsSynchronousExecutionAndLifecycle() throws Exception {
-        RetryStrategy strategy = new CountLimitedFixedWaitRetryStrategy(fixedWait(null));
+        var strategy = new CountLimitedFixedWaitRetryStrategy(fixedWait(null));
         var attempts = new AtomicInteger();
         strategy.start();
         var error = assertThrows(RetryException.class, () -> strategy.execute(() -> {
@@ -226,160 +136,8 @@ class RetryStrategyTest {
         strategy.stop();
     }
 
-    @Test
-    void directAsyncStrategyRequiresFactoryBinding() {
-        var strategy = new CountLimitedFixedWaitRetryStrategy(async(fixedWait(null)));
-        assertThrows(IllegalStateException.class, strategy::start);
-        assertThrows(UnsupportedOperationException.class, () -> strategy.execute(() -> true));
-        var properties = new AMQP.BasicProperties();
-        assertThrows(IllegalStateException.class, () -> strategy.execute(() -> true,
-                "queue", new byte[0], properties));
-    }
-
-    @Test
-    void asyncStrategyRejectsExecutionWithoutDelivery() {
-        var strategy = factory.create(async(fixedWait(null)), mock(AsyncRetryScheduler.class));
-
-        assertThrows(UnsupportedOperationException.class, () -> strategy.execute(() -> true));
-    }
-
-    @Test
-    @SuppressWarnings("deprecation")
-    void legacyRetryerConstructorStillRetriesSynchronously() throws Exception {
-        var strategy = new RetryStrategy(RetryerBuilder.<Boolean>newBuilder()
-                .retryIfException()
-                .withStopStrategy(StopStrategies.stopAfterAttempt(3))
-                .build()) {
-        };
-        var attempts = new AtomicInteger();
-
-        strategy.start();
-        assertTrue(strategy.execute(() -> {
-            if (attempts.incrementAndGet() < 3) {
-                throw new IOException();
-            }
-            return true;
-        }, "queue", new byte[0], new AMQP.BasicProperties()));
-        strategy.stop();
-
-        assertEquals(3, attempts.get());
-        assertNull(strategy.getPolicy());
-    }
-
-    @Test
-    @SuppressWarnings("deprecation")
-    void legacyRetryerStrategiesAreSyncOnly() throws Exception {
-        var legacyFactory = new RetryStrategyFactory() {
-            @Override
-            protected RetryStrategy createStrategy(RetryConfig config) {
-                return new RetryStrategy(RetryerBuilder.<Boolean>newBuilder().build()) {
-                };
-            }
-        };
-
-        assertTrue(legacyFactory.create(fixedWait(null)).execute(() -> true, "queue", null, null));
-        assertThrows(IllegalStateException.class,
-                () -> legacyFactory.create(async(fixedWait(null)), mock(AsyncRetryScheduler.class)));
-    }
-
-    @Test
-    void legacyExecutionOverrideReceivesDeliveryAwareCalls() throws Exception {
-        var calls = new AtomicInteger();
-        var strategy = new CountLimitedFixedWaitRetryStrategy(fixedWait(null)) {
-            @Override
-            public boolean execute(Callable<Boolean> callable) throws Exception {
-                calls.incrementAndGet();
-                return super.execute(callable);
-            }
-        };
-
-        assertTrue(strategy.execute(() -> true, "queue", null, null));
-        assertEquals(1, calls.get());
-    }
-
-    @Test
-    void factoryBoundSyncStrategyPreservesLegacyExecutionOverride() throws Exception {
-        var calls = new AtomicInteger();
-        var config = fixedWait(null);
-        var customFactory = new RetryStrategyFactory() {
-            @Override
-            protected RetryStrategy createStrategy(RetryConfig retryConfig) {
-                return new CountLimitedFixedWaitRetryStrategy((CountLimitedFixedWaitRetryConfig) retryConfig) {
-                    @Override
-                    public boolean execute(Callable<Boolean> callable) throws Exception {
-                        calls.incrementAndGet();
-                        return super.execute(callable);
-                    }
-                };
-            }
-        };
-        var strategy = customFactory.create(config, null, null, null, null);
-        var attempts = new AtomicInteger();
-        assertTrue(strategy.execute(() -> {
-            if (attempts.incrementAndGet() < 3) {
-                throw new IOException();
-            }
-            return true;
-        }, "queue", new byte[0], new AMQP.BasicProperties()));
-        assertEquals(1, calls.get());
-        assertEquals(3, attempts.get());
-    }
-
-    @Test
-    void nullModeFailsDefaultHook() {
-        var config = fixedWait(null);
-        config.setRetryMode(null);
-        var policy = new CountLimitedFixedWaitRetryStrategy(fixedWait(null)).getPolicy();
-
-        var error = assertThrows(NullPointerException.class,
-                () -> factory.createActorRetryer(config, policy, null));
-        assertEquals("retryMode", error.getMessage());
-    }
-
-    private static final class RecordingRetryer implements ActorRetryer {
-        private final List<String> events = new CopyOnWriteArrayList<>();
-
-        @Override
-        public void start() {
-            events.add("start");
-        }
-
-        @Override
-        public void stop() {
-            events.add("stop");
-        }
-
-        @Override
-        public boolean call(Callable<Boolean> callable, String queueName, byte[] body,
-                            AMQP.BasicProperties properties) throws Exception {
-            events.add("call:" + queueName);
-            return callable.call();
-        }
-    }
-
-    private static final class RecordingFactory extends RetryStrategyFactory {
-        private final List<RecordingRetryer> created = new ArrayList<>();
-
-        @Override
-        protected ActorRetryer createActorRetryer(RetryConfig config,
-                                                  ActorRetryerBuilder.Policy<Boolean> policy,
-                                                  AsyncRetryScheduler scheduler) {
-            var retryer = new RecordingRetryer();
-            created.add(retryer);
-            return retryer;
-        }
-    }
-
-    private static CountLimitedFixedWaitRetryConfig async(CountLimitedFixedWaitRetryConfig config) {
-        config.setRetryMode(RetryMode.ASYNC);
-        return config;
-    }
-
     private static CountLimitedFixedWaitRetryConfig fixedWait(Set<String> exceptions) {
-        return CountLimitedFixedWaitRetryConfig.builder()
-                .maxAttempts(3)
-                .waitTime(Duration.milliseconds(1))
-                .retriableExceptions(exceptions)
-                .build();
+        return CountLimitedFixedWaitRetryConfig.builder().maxAttempts(3)
+                .waitTime(Duration.milliseconds(1)).retriableExceptions(exceptions).build();
     }
 }

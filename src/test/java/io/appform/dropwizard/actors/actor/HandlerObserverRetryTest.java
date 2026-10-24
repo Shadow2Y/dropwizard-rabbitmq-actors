@@ -106,7 +106,9 @@ class HandlerObserverRetryTest {
         retryConfig.setWaitMode(WaitMode.ASYNC);
         retryConfig.setMaxAttempts(3);
         retryConfig.setWaitTime(Duration.milliseconds(WAIT_MS));
-        var strategy = new RetryStrategyFactory().create(retryConfig, scheduler);
+        var strategy = new RetryStrategyFactory().create(retryConfig);
+        strategy.setActorRetryer(new io.appform.dropwizard.actors.retry.async.AsyncRetryer(
+                strategy.getRetryPolicy(), scheduler));
         return new Handler<>(channel, mapper, TestMessage.class, 1,
                 errorCheck, strategy, exceptionHandler, freshHandler, expiredHandler, observer, QUEUE);
     }
@@ -280,7 +282,7 @@ class HandlerObserverRetryTest {
     }
 
     @Test
-    void schedulingFailureRequeuesDeliveryInsteadOfAckOrDrop() throws Exception {
+    void schedulingFailurePropagatesInsteadOfSettlingDelivery() throws Exception {
         var recorder = new RecordingObserver(new TerminalRMQObserver());
         var dropHandler = spy(new MessageDropHandler(new DropConfig()));
         var errorChecks = new AtomicInteger();
@@ -290,13 +292,16 @@ class HandlerObserverRetryTest {
             errorChecks.incrementAndGet();
             return true;
         }, dropHandler);
-        doThrow(new IOException("broker unreachable")).when(scheduler)
+        doThrow(new io.appform.dropwizard.actors.retry.async.RetrySchedulingException(
+                "broker unreachable", new IOException("broker unreachable"))).when(scheduler)
                 .schedule(anyString(), any(byte[].class), any(), any(), anyLong());
 
-        deliver(handler, false, Map.of(), DELIVERY_TAG);
+        org.junit.jupiter.api.Assertions.assertThrows(
+                io.appform.dropwizard.actors.retry.async.RetrySchedulingException.class,
+                () -> deliver(handler, false, Map.of(), DELIVERY_TAG));
 
         verify(scheduler).schedule(anyString(), any(byte[].class), any(), any(), anyLong());
-        verify(channel).basicNack(DELIVERY_TAG, false, true);
+        verify(channel, never()).basicNack(anyLong(), anyBoolean(), anyBoolean());
         verify(channel, never()).abort();
         verify(channel, never()).basicAck(anyLong(), anyBoolean());
         verify(channel, never()).basicReject(anyLong(), anyBoolean());

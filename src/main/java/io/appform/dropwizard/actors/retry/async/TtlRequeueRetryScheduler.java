@@ -3,12 +3,14 @@ package io.appform.dropwizard.actors.retry.async;
 import com.rabbitmq.client.AMQP;
 import io.appform.dropwizard.actors.actor.ActorConfig;
 import io.appform.dropwizard.actors.actor.QueueType;
+import io.appform.dropwizard.actors.actor.QueueTypeVisitorImpl;
 import io.appform.dropwizard.actors.base.utils.NamingUtils;
 import io.appform.dropwizard.actors.connectivity.PublishingChannel;
 import io.appform.dropwizard.actors.connectivity.RMQConnection;
 import io.appform.dropwizard.actors.retry.RetryPolicy;
 import java.util.Collection;
 import java.util.HashMap;
+import java.util.Locale;
 import java.util.Map;
 import java.util.Objects;
 import java.util.concurrent.atomic.AtomicBoolean;
@@ -24,6 +26,7 @@ public class TtlRequeueRetryScheduler implements AsyncRetryScheduler {
     public static final int DEFAULT_MAX_RETRY_QUEUES = 20;
     private static final String DELAY_HEADER = "x-delay";
 
+    private final String exchange;
     private final String queuePrefix;
     private final ActorConfig actorConfig;
     private final RMQConnection connection;
@@ -32,12 +35,13 @@ public class TtlRequeueRetryScheduler implements AsyncRetryScheduler {
     private final AtomicBoolean running = new AtomicBoolean(false);
 
     public TtlRequeueRetryScheduler(@NonNull RMQConnection connection, @NonNull RetryPolicy<Boolean> retryPolicy,
-        @NonNull ActorConfig actorConfig, @NonNull String retryPrefix, @NonNull PublishingChannel publisher) {
+        @NonNull ActorConfig actorConfig, @NonNull String exchange, @NonNull PublishingChannel publisher) {
+        this.exchange = exchange;
+        this.publisher = publisher;
         this.connection = connection;
         this.retryPolicy = retryPolicy;
         this.actorConfig = actorConfig;
-        this.queuePrefix = retryPrefix;
-        this.publisher = publisher;
+        this.queuePrefix = exchange + "_RETRY_" + actorConfig.getQueueType().name().toLowerCase(Locale.ROOT);
     }
 
     @Override
@@ -85,7 +89,7 @@ public class TtlRequeueRetryScheduler implements AsyncRetryScheduler {
             throw new RetrySchedulingException("Retry scheduler is not running", null);
         }
         try {
-            publisher.publish(waitingQueue(delayMs), actorConfig.getExchange(),
+            publisher.publish(waitingQueue(delayMs), waitingQueue(delayMs),
                     queueName, mergedProperties(properties, queueName, nextState).builder().expiration(null).build(),
                     body);
         } catch (Exception error) {
@@ -101,7 +105,7 @@ public class TtlRequeueRetryScheduler implements AsyncRetryScheduler {
     }
 
     protected String waitingQueue(long delayMs) {
-        return NamingUtils.prefixWithNamespace(queuePrefix + "_RETRY_DLQ_" + delayMs);
+        return NamingUtils.prefixWithNamespace(queuePrefix + "_" + delayMs);
     }
 
     private static Long headerNumber(Object value) {
@@ -121,12 +125,13 @@ public class TtlRequeueRetryScheduler implements AsyncRetryScheduler {
                 var waitingQueue = waitingQueue(delay);
                 var arguments = new HashMap<String, Object>();
                 arguments.put("x-message-ttl", delay);
-                arguments.put(QueueType.X_QUEUE_TYPE, actorConfig.getQueueType());
-                arguments.put("x-dead-letter-exchange", actorConfig.getExchange());
+                arguments.put(QueueType.X_QUEUE_TYPE, actorConfig.getQueueType()
+                        .handleConfig(new QueueTypeVisitorImpl(actorConfig)).get(QueueType.X_QUEUE_TYPE));
+                arguments.put("x-dead-letter-exchange", exchange);
                 topology.exchangeDeclare(waitingQueue, "fanout", true);
                 connection.ensure(topology, waitingQueue, "", waitingQueue, arguments);
                 log.info("Declared async retry waiting queue: {}, delayMs: {}, dead-letters to: {}",
-                    waitingQueue, delay, actorConfig.getExchange());
+                    waitingQueue, delay, exchange);
             }
         }
     }
