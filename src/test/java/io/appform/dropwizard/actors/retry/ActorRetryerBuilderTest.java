@@ -23,7 +23,7 @@ class ActorRetryerBuilderTest {
         assertFalse(policy.stopStrategy().shouldStop(failure));
         assertEquals(0, policy.waitStrategy().computeSleepTime(failure));
         assertThrows(ExecutionException.class,
-                () -> policy.buildSyncRetryer().call(() -> { throw new IOException(); }));
+                () -> policy.buildRetryer().call(() -> { throw new IOException(); }));
     }
 
     @Test

@@ -40,6 +40,6 @@ public class TimeLimitedIncrementalWaitRetryStrategy extends RetryStrategy {
                                 TimeUnit.MILLISECONDS,
                                 config.getWaitIncrement().toMilliseconds(),
                                 TimeUnit.MILLISECONDS))
-                .build(), config.getRetryMode());
+                .build());
     }
 }

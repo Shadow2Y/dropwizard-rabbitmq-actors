@@ -2,14 +2,14 @@ package io.appform.dropwizard.actors.retry.async;
 
 import com.github.rholder.retry.RetryException;
 import com.rabbitmq.client.AMQP;
-import io.appform.dropwizard.actors.retry.ActorRetryerBuilder;
-import lombok.extern.slf4j.Slf4j;
-
+import io.appform.dropwizard.actors.retry.RetryPolicy;
+import io.appform.dropwizard.actors.retry.WaitMode;
+import java.time.Clock;
 import java.util.Objects;
 import java.util.Set;
 import java.util.TreeSet;
 import java.util.concurrent.Callable;
-import java.util.function.LongSupplier;
+import lombok.extern.slf4j.Slf4j;
 
 /**
  * Broker-scheduled retries: a failed attempt is handed off to an
@@ -19,52 +19,25 @@ import java.util.function.LongSupplier;
 @Slf4j
 public class AsyncRetryer implements ActorRetryer {
 
-    private static final int MAX_PLANNED_ATTEMPTS = 5;
     private static final Throwable PLANNED_FAILURE = new IllegalStateException("Planned retry");
 
-    private final ActorRetryerBuilder.Policy<Boolean> retryPolicy;
+    private final Clock clock;
+    private final RetryPolicy<Boolean> retryPolicy;
     private final AsyncRetryScheduler asyncRetryScheduler;
-    private final LongSupplier clock;
 
-    public AsyncRetryer(ActorRetryerBuilder.Policy<Boolean> retryPolicy, AsyncRetryScheduler asyncRetryScheduler) {
-        this(retryPolicy, asyncRetryScheduler, System::currentTimeMillis);
-    }
-
-    public AsyncRetryer(ActorRetryerBuilder.Policy<Boolean> retryPolicy,
-                        AsyncRetryScheduler asyncRetryScheduler, LongSupplier clock) {
+    public AsyncRetryer(RetryPolicy<Boolean> retryPolicy, AsyncRetryScheduler asyncRetryScheduler, Clock clock) {
         this.retryPolicy = Objects.requireNonNull(retryPolicy, "retryPolicy");
         this.asyncRetryScheduler = Objects.requireNonNull(asyncRetryScheduler, "asyncRetryScheduler");
         this.clock = Objects.requireNonNull(clock, "clock");
     }
 
+    public AsyncRetryer(RetryPolicy<Boolean> retryPolicy, AsyncRetryScheduler asyncRetryScheduler) {
+        this(retryPolicy, asyncRetryScheduler, Clock.systemDefaultZone());
+    }
+
     @Override
     public void start() throws Exception {
         asyncRetryScheduler.start();
-        try {
-            asyncRetryScheduler.prepare(plannedDelays());
-        } catch (Exception error) {
-            try {
-                asyncRetryScheduler.stop();
-            } catch (Exception stopError) {
-                error.addSuppressed(stopError);
-            }
-            throw error;
-        }
-    }
-
-    Set<Long> plannedDelays() throws RetrySchedulingRejectedException {
-        var delays = new TreeSet<Long>();
-        var elapsed = 0L;
-        for (long attemptNumber = 1; attemptNumber <= MAX_PLANNED_ATTEMPTS; attemptNumber++) {
-            var attempt = new DeliveryAttempt(null, PLANNED_FAILURE, attemptNumber, elapsed);
-            if (retryPolicy.stopStrategy().shouldStop(attempt)) {
-                return delays;
-            }
-            var delay = retryPolicy.waitStrategy().computeSleepTime(attempt);
-            delays.add(delay);
-            elapsed += delay;
-        }
-        throw new RetrySchedulingRejectedException("Planned delays exceed max attempts");
     }
 
     @Override
@@ -77,7 +50,7 @@ public class AsyncRetryer implements ActorRetryer {
                         AMQP.BasicProperties properties) throws Exception {
         Objects.requireNonNull(callable, "callable");
         Objects.requireNonNull(queueName, "queueName");
-        var now = clock.getAsLong();
+        var now = clock.millis();
         var state = asyncRetryScheduler.restoreState(queueName, properties, now);
         if (state.attemptNumber() > 1) {
             log.debug("Async retry redelivery: queue: {}, attempt: {}, messageId: {}, correlationId: {}",
@@ -112,6 +85,11 @@ public class AsyncRetryer implements ActorRetryer {
         return true;
     }
 
+    @Override
+    public WaitMode getRetryMode() {
+        return WaitMode.ASYNC;
+    }
+
     private DeliveryAttempt execute(Callable<Boolean> callable, RetryState state) {
         DeliveryAttempt attempt;
         try {
@@ -124,6 +102,26 @@ public class AsyncRetryer implements ActorRetryer {
     }
 
     private long elapsed(long startedAt) {
-        return Math.max(clock.getAsLong() - startedAt, 0);
+        return Math.max(clock.millis() - startedAt, 0);
     }
+
+    public static Set<Long> getPossibleDelays(RetryPolicy<Boolean> retryPolicy, int maxAttempts, boolean throwIfBreached) throws RetrySchedulingRejectedException {
+        var delays = new TreeSet<Long>();
+        var elapsed = 0L;
+        for (long attemptNumber = 1; attemptNumber <= maxAttempts; attemptNumber++) {
+            var attempt = new DeliveryAttempt(null, PLANNED_FAILURE, attemptNumber, elapsed);
+            if (retryPolicy.stopStrategy().shouldStop(attempt)) {
+                return delays;
+            }
+            var delay = retryPolicy.waitStrategy().computeSleepTime(attempt);
+            delays.add(delay);
+            elapsed += delay;
+        }
+        if(throwIfBreached) {
+            throw new RetrySchedulingRejectedException("Planned delays exceed max attempts");
+        } else {
+            return delays;
+        }
+    }
+
 }

@@ -19,15 +19,14 @@ package io.appform.dropwizard.actors.retry.impl;
 import com.github.rholder.retry.StopStrategies;
 import io.appform.dropwizard.actors.retry.ActorRetryerBuilder;
 import io.appform.dropwizard.actors.retry.RetryStrategy;
-import io.appform.dropwizard.actors.retry.config.NoRetryConfig;
 
 /**
  * No retries
  */
 public class NoRetryStrategy extends RetryStrategy {
-    public NoRetryStrategy(NoRetryConfig config) {
+    public NoRetryStrategy() {
         super(ActorRetryerBuilder.<Boolean>newBuilder()
                 .withStopStrategy(StopStrategies.stopAfterAttempt(1))
-                .build(), config.getRetryMode());
+                .build());
     }
 }

@@ -16,7 +16,7 @@ import io.appform.dropwizard.actors.exceptionhandler.handlers.ExceptionHandler;
 import io.appform.dropwizard.actors.exceptionhandler.handlers.MessageDropHandler;
 import io.appform.dropwizard.actors.exceptionhandler.handlers.MessageSidelineHandler;
 import io.appform.dropwizard.actors.observers.TerminalRMQObserver;
-import io.appform.dropwizard.actors.retry.RetryMode;
+import io.appform.dropwizard.actors.retry.WaitMode;
 import io.appform.dropwizard.actors.retry.RetryStrategy;
 import io.appform.dropwizard.actors.retry.RetryStrategyFactory;
 import io.appform.dropwizard.actors.retry.config.CountLimitedFixedWaitRetryConfig;
@@ -165,7 +165,7 @@ class HandlerAsyncRetryTest {
         doThrow(new IOException("broker unavailable")).when(scheduler)
                 .schedule(anyString(), any(), any(), any(), anyLong());
         var config = new CountLimitedFixedWaitRetryConfig();
-        config.setRetryMode(RetryMode.ASYNC);
+        config.setWaitMode(WaitMode.ASYNC);
         config.setMaxAttempts(3);
         var strategy = new RetryStrategyFactory().create(config, scheduler);
         var handled = new AtomicBoolean();
@@ -210,7 +210,7 @@ class HandlerAsyncRetryTest {
         var scheduler = new TtlRequeueRetryScheduler(new TtlRequeueRetryScheduler.Context(connection,
                 new ActorConfig(), "exchange", QUEUE, Set.of(QUEUE)), 5000, 1);
         var config = new CountLimitedIncrementalWaitRetryConfig();
-        config.setRetryMode(RetryMode.ASYNC);
+        config.setWaitMode(WaitMode.ASYNC);
         config.setMaxAttempts(4);
         var strategy = new RetryStrategyFactory().create(config, scheduler);
         var attempts = new AtomicInteger();

@@ -1,38 +1,5 @@
 package io.appform.dropwizard.actors.actor;
 
-import com.fasterxml.jackson.databind.ObjectMapper;
-import com.rabbitmq.client.AMQP;
-import com.rabbitmq.client.Channel;
-import com.rabbitmq.client.Consumer;
-import com.rabbitmq.client.Envelope;
-import com.rabbitmq.client.ShutdownListener;
-import com.rabbitmq.client.ShutdownSignalException;
-import io.appform.dropwizard.actors.base.Handler;
-import io.appform.dropwizard.actors.base.RandomShardIdCalculator;
-import io.appform.dropwizard.actors.base.utils.NamingUtils;
-import io.appform.dropwizard.actors.connectivity.RMQConnection;
-import io.appform.dropwizard.actors.connectivity.strategy.DefaultConnectionStrategy;
-import io.appform.dropwizard.actors.exceptionhandler.ExceptionHandlingFactory;
-import io.appform.dropwizard.actors.observers.TerminalRMQObserver;
-import io.appform.dropwizard.actors.retry.RetryMode;
-import io.appform.dropwizard.actors.retry.RetryQueueScope;
-import io.appform.dropwizard.actors.retry.RetryStrategyFactory;
-import io.appform.dropwizard.actors.retry.async.TtlRequeueRetryScheduler;
-import io.appform.dropwizard.actors.retry.config.CountLimitedFixedWaitRetryConfig;
-import io.dropwizard.util.Duration;
-import org.junit.jupiter.api.BeforeEach;
-import org.junit.jupiter.api.Test;
-import org.mockito.invocation.Invocation;
-
-import java.io.IOException;
-import java.util.HashMap;
-import java.util.List;
-import java.util.Map;
-import java.util.concurrent.CopyOnWriteArrayList;
-import java.util.concurrent.Executors;
-import java.util.concurrent.TimeUnit;
-import java.util.concurrent.atomic.AtomicReference;
-
 import static org.awaitility.Awaitility.await;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertNull;
@@ -51,6 +18,38 @@ import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.times;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
+
+import com.fasterxml.jackson.databind.ObjectMapper;
+import com.rabbitmq.client.AMQP;
+import com.rabbitmq.client.Channel;
+import com.rabbitmq.client.Consumer;
+import com.rabbitmq.client.Envelope;
+import com.rabbitmq.client.ShutdownListener;
+import com.rabbitmq.client.ShutdownSignalException;
+import io.appform.dropwizard.actors.base.Handler;
+import io.appform.dropwizard.actors.base.RandomShardIdCalculator;
+import io.appform.dropwizard.actors.base.utils.NamingUtils;
+import io.appform.dropwizard.actors.connectivity.RMQConnection;
+import io.appform.dropwizard.actors.connectivity.strategy.DefaultConnectionStrategy;
+import io.appform.dropwizard.actors.exceptionhandler.ExceptionHandlingFactory;
+import io.appform.dropwizard.actors.observers.TerminalRMQObserver;
+import io.appform.dropwizard.actors.retry.RetryMode;
+import io.appform.dropwizard.actors.retry.RetryStrategyFactory;
+import io.appform.dropwizard.actors.retry.async.TtlRequeueRetryScheduler;
+import io.appform.dropwizard.actors.retry.async.TtlRequeueRetryScheduler.RetryQueueIsolation;
+import io.appform.dropwizard.actors.retry.config.CountLimitedFixedWaitRetryConfig;
+import io.dropwizard.util.Duration;
+import java.io.IOException;
+import java.util.HashMap;
+import java.util.List;
+import java.util.Map;
+import java.util.concurrent.CopyOnWriteArrayList;
+import java.util.concurrent.Executors;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicReference;
+import org.junit.jupiter.api.BeforeEach;
+import org.junit.jupiter.api.Test;
+import org.mockito.invocation.Invocation;
 
 /**
  * Mock-based wiring test: real {@link UnmanagedBaseActor} construction with async retry for the main
@@ -326,7 +325,7 @@ class AsyncRetryWiringTest {
     @Test
     void queueScopeGivesTheConsumerItsOwnWaitingQueue() throws Exception {
         var retry = asyncRetry(3);
-        retry.setAsyncRetryQueueScope(RetryQueueScope.QUEUE);
+        retry.setScope(RetryQueueIsolation.QUEUE);
         var actor = startActor(actorConfig(retry, false, null, null));
         var waitingQueue = QUEUE + "_RETRY_" + WAIT_MS;
 

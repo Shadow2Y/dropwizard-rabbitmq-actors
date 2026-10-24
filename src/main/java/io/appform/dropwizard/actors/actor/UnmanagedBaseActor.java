@@ -153,8 +153,7 @@ public class UnmanagedBaseActor<Message> {
                         producerConnection, mapper),
                 new UnmanagedConsumer<>(NamingUtils.queueName(config.getPrefix(), name), config.getPrefetchCount(),
                         config.getConcurrency(), config.isSharded(), config.getShardCount(), config.getConsumer(),
-                         consumerConnection, mapper, retryStrategyFactory.create(config.getRetryConfig(), config,
-                         producerConnection, config.getExchange(), NamingUtils.queueName(config.getPrefix(), name)),
+                         consumerConnection, mapper, retryStrategyFactory.create(config, producerConnection, NamingUtils.queueName(config.getPrefix(), name)),
                         exceptionHandlingFactory.create(config.getExceptionHandlerConfig()), clazz, handlerFunction,
                         expiredMessageHandlingFunction, errorCheckFunction), config.isSidelineProcessorEnabled()
                                                                              ? new UnmanagedConsumer<>(
@@ -163,10 +162,8 @@ public class UnmanagedBaseActor<Message> {
                                 .getConcurrency(), config.isSharded(), config
                         .getShardCount(), config.getSidelineProcessorConfig()
                         .getConsumerConfig(),
-                         sidelineProcessorConnection, mapper, retryStrategyFactory.create(
-                         config.getSidelineProcessorConfig().getRetryConfig(), config, producerConnection,
-                         NamingUtils.getSidelineProcessor(config.getExchange()),
-                         NamingUtils.sidelineProcessorQueueName(config.getPrefix(), name)),
+                         sidelineProcessorConnection, mapper, retryStrategyFactory.create(config, producerConnection,
+                        NamingUtils.sidelineProcessorQueueName(config.getPrefix(), name)),
                         exceptionHandlingFactory.create(config.getExceptionHandlerConfig()), clazz,
                         sidelineProcessorHandleFunction, sidelineProcessorExpiredMessageHandlingFunction,
                         errorCheckFunction)

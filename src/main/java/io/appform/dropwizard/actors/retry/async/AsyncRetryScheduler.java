@@ -2,18 +2,9 @@ package io.appform.dropwizard.actors.retry.async;
 
 import com.rabbitmq.client.AMQP;
 
-import java.util.Set;
-
 public interface AsyncRetryScheduler {
 
     default void start() throws Exception {
-    }
-
-    /**
-     * Receives, after {@link #start()}, every delay the retry policy can request. Implementations may provision
-     * them eagerly and should throw on misconfiguration so the consumer fails to start.
-     */
-    default void prepare(Set<Long> delaysMs) throws Exception {
     }
 
     default void stop() throws Exception {

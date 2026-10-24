@@ -94,31 +94,21 @@ public class Handler<Message> extends DefaultConsumer {
                                final AMQP.BasicProperties properties,
                                final byte[] body) throws IOException {
         running = true;
-        try {
-            if (processDelivery(envelope, properties, body)) {
-                getChannel().basicAck(envelope.getDeliveryTag(), false);
-            } else {
-                getChannel().basicReject(envelope.getDeliveryTag(), false);
-            }
-        } catch (RetrySchedulingException t) {
-            log.error("Retry handoff failed; re-queuing delivery", t);
-            getChannel().basicNack(envelope.getDeliveryTag(), false, true);
-        } finally {
-            synchronized (this) {
-                running = false;
-                notifyAll();
-            }
+        if (processDelivery(envelope, properties, body)) {
+            getChannel().basicAck(envelope.getDeliveryTag(), false);
+        } else {
+            getChannel().basicReject(envelope.getDeliveryTag(), false);
         }
     }
 
-    private boolean processDelivery(final Envelope envelope,
+    protected boolean processDelivery(final Envelope envelope,
                                     final AMQP.BasicProperties properties,
                                     final byte[] body) throws RetrySchedulingException {
         try {
-            val message = mapper.readValue(body, clazz);
-            Callable<Boolean> handleCallable = () -> handle(message, populateMessageMeta(envelope, properties),
-                    isExpired(properties));
-            return retryStrategy.execute(handleCallable, queueName, body, properties);
+            var message = mapper.readValue(body, clazz);
+            return retryStrategy.execute(
+                () -> handle(message, populateMessageMeta(envelope, properties), isExpired(properties)),
+                queueName, body, properties);
         } catch (RetrySchedulingException failure) {
             throw failure;
         } catch (Throwable failure) {

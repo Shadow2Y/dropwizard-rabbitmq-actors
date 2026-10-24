@@ -81,7 +81,7 @@ class RetryStrategyFactoryTest {
     void contextualAsyncCreationUsesOverriddenSchedulerHook() throws Exception {
         var scheduler = mock(AsyncRetryScheduler.class);
         var config = new NoRetryConfig();
-        config.setRetryMode(RetryMode.ASYNC);
+        config.setWaitMode(WaitMode.ASYNC);
         var actorConfig = new ActorConfig();
         var connection = mock(RMQConnection.class);
         var factory = new RetryStrategyFactory() {
@@ -124,7 +124,7 @@ class RetryStrategyFactoryTest {
     @Test
     void incrementalRetriesCanExceedThirtyTwoDelaysWithConfiguredLimit() throws Exception {
         var config = new CountLimitedIncrementalWaitRetryConfig();
-        config.setRetryMode(RetryMode.ASYNC);
+        config.setWaitMode(WaitMode.ASYNC);
         config.setMaxAttempts(40);
         config.setAsyncMaxDelayLevels(39);
         var connection = mock(RMQConnection.class);
@@ -177,7 +177,7 @@ class RetryStrategyFactoryTest {
     @Test
     void nullModeFailsBeforeConstructingTransport() {
         var config = new NoRetryConfig();
-        config.setRetryMode(null);
+        config.setWaitMode(null);
 
         var error = assertThrows(NullPointerException.class,
                 () -> new RetryStrategyFactory().create(config, null, null, null, null));
@@ -188,7 +188,7 @@ class RetryStrategyFactoryTest {
     @Test
     void asyncCreationFailsFastWhenLegacyCreateOverrideWouldBeBypassed() {
         var config = new NoRetryConfig();
-        config.setRetryMode(RetryMode.ASYNC);
+        config.setWaitMode(WaitMode.ASYNC);
         var connection = mock(RMQConnection.class);
         var factory = new RetryStrategyFactory() {
             @Override
@@ -207,7 +207,7 @@ class RetryStrategyFactoryTest {
     @Test
     void asyncStartFailsWhenPolicyNeedsMoreDelayLevelsThanConfigured() throws Exception {
         var config = new CountLimitedIncrementalWaitRetryConfig();
-        config.setRetryMode(RetryMode.ASYNC);
+        config.setWaitMode(WaitMode.ASYNC);
         config.setMaxAttempts(40);
         var connection = mock(RMQConnection.class);
         when(connection.getRootObserver()).thenReturn(new TerminalRMQObserver());

@@ -36,6 +36,6 @@ public class CountLimitedFixedWaitRetryStrategy extends RetryStrategy {
                 .withStopStrategy(StopStrategies.stopAfterAttempt(config.getMaxAttempts()))
                 .withWaitStrategy(
                         WaitStrategies.fixedWait(config.getWaitTime().toMilliseconds(), TimeUnit.MILLISECONDS))
-                .build(), config.getRetryMode());
+                .build());
     }
 }

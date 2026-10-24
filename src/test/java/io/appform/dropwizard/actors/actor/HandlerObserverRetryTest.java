@@ -17,7 +17,7 @@ import io.appform.dropwizard.actors.observers.PublishMessageDetails;
 import io.appform.dropwizard.actors.observers.PublishObserverContext;
 import io.appform.dropwizard.actors.observers.RMQObserver;
 import io.appform.dropwizard.actors.observers.TerminalRMQObserver;
-import io.appform.dropwizard.actors.retry.RetryMode;
+import io.appform.dropwizard.actors.retry.WaitMode;
 import io.appform.dropwizard.actors.retry.RetryStrategyFactory;
 import io.appform.dropwizard.actors.retry.async.AsyncRetryScheduler;
 import io.appform.dropwizard.actors.retry.async.RetryState;
@@ -103,7 +103,7 @@ class HandlerObserverRetryTest {
                                         Function<Throwable, Boolean> errorCheck,
                                         ExceptionHandler exceptionHandler) throws Exception {
         var retryConfig = new CountLimitedFixedWaitRetryConfig();
-        retryConfig.setRetryMode(RetryMode.ASYNC);
+        retryConfig.setWaitMode(WaitMode.ASYNC);
         retryConfig.setMaxAttempts(3);
         retryConfig.setWaitTime(Duration.milliseconds(WAIT_MS));
         var strategy = new RetryStrategyFactory().create(retryConfig, scheduler);

@@ -14,7 +14,7 @@ import io.appform.dropwizard.actors.connectivity.strategy.DefaultConnectionStrat
 import io.appform.dropwizard.actors.exceptionhandler.ExceptionHandlingFactory;
 import io.appform.dropwizard.actors.junit.extension.RabbitMQExtension;
 import io.appform.dropwizard.actors.observers.TerminalRMQObserver;
-import io.appform.dropwizard.actors.retry.RetryMode;
+import io.appform.dropwizard.actors.retry.WaitMode;
 import io.appform.dropwizard.actors.retry.RetryStrategyFactory;
 import io.appform.dropwizard.actors.retry.config.CountLimitedFixedWaitRetryConfig;
 import io.appform.dropwizard.actors.utils.RMQTestUtils;
@@ -109,7 +109,7 @@ public class AsyncRetryIntegrationTest {
 
     private CountLimitedFixedWaitRetryConfig asyncRetry(int maxAttempts, long waitMs) {
         val retry = new CountLimitedFixedWaitRetryConfig();
-        retry.setRetryMode(RetryMode.ASYNC);
+        retry.setWaitMode(WaitMode.ASYNC);
         retry.setMaxAttempts(maxAttempts);
         retry.setWaitTime(Duration.milliseconds(waitMs));
         return retry;
