@@ -30,6 +30,7 @@ import io.appform.dropwizard.actors.retry.config.RetryConfig;
 import io.appform.dropwizard.actors.retry.config.TimeLimitedExponentialWaitRetryConfig;
 import io.appform.dropwizard.actors.retry.config.TimeLimitedFixedWaitRetryConfig;
 import io.appform.dropwizard.actors.retry.config.TimeLimitedIncrementalWaitRetryConfig;
+import io.appform.dropwizard.actors.retry.config.TtlRequeueConfig;
 import io.appform.dropwizard.actors.retry.impl.CountLimitedExponentialWaitRetryStrategy;
 import io.appform.dropwizard.actors.retry.impl.CountLimitedFixedWaitRetryStrategy;
 import io.appform.dropwizard.actors.retry.impl.CountLimitedIncrementalWaitRetryStrategy;
@@ -66,7 +67,7 @@ public class RetryStrategyFactory {
         }
         var retryPolicy = Objects.requireNonNull(strategy.getRetryPolicy(), "retryPolicy");
         var actorRetryer = new AsyncRetryer(retryPolicy,
-            new TtlRequeueRetryScheduler(connection, retryPolicy, actorConfig, exchange,
+            new TtlRequeueRetryScheduler(connection, retryPolicy, actorConfig, exchange, queueName, actorConfig.getRetryConfig().getTtlRequeue(),
                     new PublishingChannel(connection, 2000))
         );
         return strategy.setActorRetryer(actorRetryer);

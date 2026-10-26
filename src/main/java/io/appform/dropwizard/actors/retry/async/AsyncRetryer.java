@@ -26,9 +26,9 @@ public class AsyncRetryer implements ActorRetryer {
     private final AsyncRetryScheduler asyncRetryScheduler;
 
     public AsyncRetryer(RetryPolicy<Boolean> retryPolicy, AsyncRetryScheduler asyncRetryScheduler, Clock clock) {
+        this.clock = Objects.requireNonNull(clock, "clock");
         this.retryPolicy = Objects.requireNonNull(retryPolicy, "retryPolicy");
         this.asyncRetryScheduler = Objects.requireNonNull(asyncRetryScheduler, "asyncRetryScheduler");
-        this.clock = Objects.requireNonNull(clock, "clock");
     }
 
     public AsyncRetryer(RetryPolicy<Boolean> retryPolicy, AsyncRetryScheduler asyncRetryScheduler) {
@@ -118,7 +118,7 @@ public class AsyncRetryer implements ActorRetryer {
             elapsed += delay;
         }
         if(throwIfBreached) {
-            throw new RetrySchedulingRejectedException("Planned delays exceed max attempts");
+            throw new RetrySchedulingRejectedException("Retry policy does not stop within " + maxAttempts + " planned attempts");
         } else {
             return delays;
         }

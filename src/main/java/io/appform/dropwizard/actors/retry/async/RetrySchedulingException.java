@@ -4,8 +4,8 @@ import java.io.IOException;
 
 /**
  * Signals that an async retry could not be handed off to the broker.
- * Propagates transport failure out of the consumer callback without applying
- * the message-processing exception policy or settling the delivery.
+ * The consumer requeues the original delivery instead of applying the message-processing
+ * exception policy, unless the error check marks the failure as ignorable.
  */
 public class RetrySchedulingException extends IOException {
 

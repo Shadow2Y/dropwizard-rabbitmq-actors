@@ -18,8 +18,8 @@ package io.appform.dropwizard.actors.retry.config;
 
 import com.fasterxml.jackson.annotation.JsonSubTypes;
 import com.fasterxml.jackson.annotation.JsonTypeInfo;
-import io.appform.dropwizard.actors.retry.WaitMode;
 import io.appform.dropwizard.actors.retry.RetryType;
+import io.appform.dropwizard.actors.retry.WaitMode;
 import java.util.Set;
 import javax.validation.constraints.NotNull;
 import lombok.Data;
@@ -50,6 +50,8 @@ public abstract class RetryConfig {
     private final RetryType type;
 
     private Set<String> retriableExceptions;
+
+    private TtlRequeueConfig ttlRequeue = null;
 
     @NotNull
     private WaitMode waitMode = WaitMode.SYNC;

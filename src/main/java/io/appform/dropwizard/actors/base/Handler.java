@@ -94,10 +94,15 @@ public class Handler<Message> extends DefaultConsumer {
                                final byte[] body) throws IOException {
         running = true;
         try {
-            if (processDelivery(envelope, properties, body)) {
-                getChannel().basicAck(envelope.getDeliveryTag(), false);
-            } else {
-                getChannel().basicReject(envelope.getDeliveryTag(), false);
+            final long deliveryTag = envelope.getDeliveryTag();
+            try {
+                if (processDelivery(envelope, properties, body)) {
+                    getChannel().basicAck(deliveryTag, false);
+                } else {
+                    getChannel().basicReject(deliveryTag, false);
+                }
+            } catch (RetrySchedulingException failure) {
+                handleRetrySchedulingFailure(deliveryTag, failure);
             }
         } finally {
             synchronized (this) {
@@ -119,6 +124,17 @@ public class Handler<Message> extends DefaultConsumer {
             throw failure;
         } catch (Throwable failure) {
             return handleProcessingFailure(failure);
+        }
+    }
+
+    private void handleRetrySchedulingFailure(final long deliveryTag,
+                                              final RetrySchedulingException failure) throws IOException {
+        if (Boolean.TRUE.equals(errorCheckFunction.apply(failure))) {
+            log.warn("Acknowledging message due to retry handoff failure on queue {}: ", queueName, failure);
+            getChannel().basicAck(deliveryTag, false);
+        } else {
+            log.error("Retry handoff failed on queue {}, requeueing message", queueName, failure);
+            getChannel().basicReject(deliveryTag, true);
         }
     }
 

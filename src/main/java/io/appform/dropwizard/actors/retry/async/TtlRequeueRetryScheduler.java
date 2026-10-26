@@ -8,23 +8,24 @@ import io.appform.dropwizard.actors.base.utils.NamingUtils;
 import io.appform.dropwizard.actors.connectivity.PublishingChannel;
 import io.appform.dropwizard.actors.connectivity.RMQConnection;
 import io.appform.dropwizard.actors.retry.RetryPolicy;
+import io.appform.dropwizard.actors.retry.config.TtlRequeueConfig;
 import java.util.Collection;
 import java.util.HashMap;
 import java.util.Locale;
 import java.util.Map;
-import java.util.Objects;
 import java.util.concurrent.atomic.AtomicBoolean;
+import javax.annotation.Nullable;
 import lombok.NonNull;
 import lombok.extern.slf4j.Slf4j;
 
 @Slf4j
 public class TtlRequeueRetryScheduler implements AsyncRetryScheduler {
 
-    static final String RETRY_QUEUE_HEADER = "x-actor-retry-queue";
-    static final String RETRY_ATTEMPT_HEADER = "x-actor-retry-attempt";
-    static final String RETRY_STARTED_AT_HEADER = "x-actor-retry-started-at";
-    public static final int DEFAULT_MAX_RETRY_QUEUES = 20;
-    private static final String DELAY_HEADER = "x-delay";
+    static final String DELAY_HEADER = "x-delay";
+
+    private int maxRetryQueues = 20;
+    private int maxPlannedAttempts = 20;
+    private IsolationScope queueScope = IsolationScope.EXCHANGE;
 
     private final String exchange;
     private final String queuePrefix;
@@ -35,13 +36,21 @@ public class TtlRequeueRetryScheduler implements AsyncRetryScheduler {
     private final AtomicBoolean running = new AtomicBoolean(false);
 
     public TtlRequeueRetryScheduler(@NonNull RMQConnection connection, @NonNull RetryPolicy<Boolean> retryPolicy,
-        @NonNull ActorConfig actorConfig, @NonNull String exchange, @NonNull PublishingChannel publisher) {
+        @NonNull ActorConfig actorConfig, @NonNull String exchange, String queueName, @Nullable TtlRequeueConfig config,
+        @NonNull PublishingChannel publisher) {
         this.exchange = exchange;
         this.publisher = publisher;
         this.connection = connection;
         this.retryPolicy = retryPolicy;
         this.actorConfig = actorConfig;
-        this.queuePrefix = exchange + "_RETRY_" + actorConfig.getQueueType().name().toLowerCase(Locale.ROOT);
+        if(config!=null) {
+            this.queueScope = config.getQueueScope();
+            this.maxRetryQueues = config.getMaxRetryQueues();
+            this.maxPlannedAttempts = config.getMaxPlannedAttempts();
+        }
+        var queueType = actorConfig.getQueueType().name().toLowerCase(Locale.ROOT);
+        String identifier = queueScope == IsolationScope.QUEUE ? queueName : exchange;
+        this.queuePrefix = getQueuePrefix(identifier, queueType);
     }
 
     @Override
@@ -49,37 +58,14 @@ public class TtlRequeueRetryScheduler implements AsyncRetryScheduler {
         if (running.get()) {
             return;
         }
+        var delays = AsyncRetryer.getPossibleDelays(retryPolicy, maxPlannedAttempts, true);
+        if (delays.size() > maxRetryQueues) {
+            throw new RetrySchedulingRejectedException("Retry policy needs " + delays.size()
+                    + " retry queues, more than the allowed " + maxRetryQueues);
+        }
         publisher.start();
-        declareTopology(AsyncRetryer.getPossibleDelays(retryPolicy, 10, true));
+        declareTopology(delays);
         running.set(true);
-    }
-
-    @Override
-    public RetryState restoreState(String queueName, AMQP.BasicProperties properties, long now) {
-        Objects.requireNonNull(queueName, "queueName");
-        var headers = properties == null || properties.getHeaders() == null
-                ? Map.<String, Object>of() : properties.getHeaders();
-        var retryQueue = headers.get(RETRY_QUEUE_HEADER);
-        var attemptHeader = headers.get(RETRY_ATTEMPT_HEADER);
-        var startedAtHeader = headers.get(RETRY_STARTED_AT_HEADER);
-        if (retryQueue == null && attemptHeader == null && startedAtHeader == null) {
-            return new RetryState(1, now);
-        }
-        if (retryQueue == null) {
-            throw malformedMetadata("Retry metadata is missing the queue header");
-        }
-        if (!queueName.equals(retryQueue.toString())) {
-            return new RetryState(1, now);
-        }
-        var attemptCount = headerNumber(attemptHeader);
-        var startedAt = headerNumber(startedAtHeader);
-        if (attemptCount == null || attemptCount <= 0 || attemptCount >= Integer.MAX_VALUE) {
-            throw malformedMetadata("Attempt count must be a positive integer below " + Integer.MAX_VALUE);
-        }
-        if (startedAt == null || startedAt < 0) {
-            throw malformedMetadata("Started-at must be a nonnegative timestamp");
-        }
-        return new RetryState(attemptCount, startedAt);
     }
 
     @Override
@@ -105,18 +91,9 @@ public class TtlRequeueRetryScheduler implements AsyncRetryScheduler {
     }
 
     protected String waitingQueue(long delayMs) {
-        return NamingUtils.prefixWithNamespace(queuePrefix + "_" + delayMs);
-    }
-
-    private static Long headerNumber(Object value) {
-        if (value instanceof Integer || value instanceof Long) {
-            return ((Number) value).longValue();
-        }
-        return null;
-    }
-
-    private static IllegalStateException malformedMetadata(String detail) {
-        return new IllegalStateException("Malformed actor retry metadata: " + detail);
+        var name = queuePrefix + "_" + delayMs;
+        // actor queue names already carry the namespace
+        return queueScope == IsolationScope.QUEUE ? name : NamingUtils.prefixWithNamespace(name);
     }
 
     private void declareTopology(Collection<Long> delays) throws Exception {
@@ -147,6 +124,25 @@ public class TtlRequeueRetryScheduler implements AsyncRetryScheduler {
         merged.put(RETRY_ATTEMPT_HEADER, nextState.attemptNumber());
         merged.put(RETRY_STARTED_AT_HEADER, nextState.startedAt());
         return properties.builder().headers(merged).build();
+    }
+
+    public static String getQueuePrefix(@NonNull String identifier, @NonNull String queueType) {
+        return identifier + "_RETRY_" + queueType;
+    }
+
+
+    public enum IsolationScope {
+
+        /**
+         * One set of delay queues per exchange and queue type, shared by every queue bound to that exchange.
+         */
+        EXCHANGE,
+
+        /**
+         * One set of delay queues per actor queue, shared only by the shards of that queue.
+         */
+        QUEUE
+
     }
 
 }

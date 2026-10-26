@@ -46,7 +46,7 @@ class TtlRequeueRetrySchedulerTest {
                 .withStopStrategy(StopStrategies.stopAfterAttempt(3))
                 .withWaitStrategy(WaitStrategies.fixedWait(100, TimeUnit.MILLISECONDS)).build();
         return new TtlRequeueRetryScheduler(connection, policy,
-                ActorConfig.builder().exchange(exchange).queueType(type).build(), exchange,
+                ActorConfig.builder().exchange(exchange).queueType(type).build(), exchange, "", null,
                 new PublishingChannel(connection, 5000));
     }
 
